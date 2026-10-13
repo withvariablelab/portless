@@ -10,14 +10,24 @@ Pushing a new version to `main` is what publishes. There is no separate approval
 
 ## One-time setup
 
-- Publishing uses [npm trusted publishing](https://docs.npmjs.com/trusted-publishers): the `@variablelab/portless` package on npm trusts the `release.yml` workflow of `variableland/portless` running in the `Release` environment, and the job exchanges its GitHub OIDC token for a short-lived npm token. No long-lived token is stored. To re-create the relationship (interactive 2FA):
+- Publishing uses [npm trusted publishing](https://docs.npmjs.com/trusted-publishers): the `@variablelab/portless` package on npm trusts the `release.yml` workflow of `withvariablelab/portless` running in the `Release` environment, and the job exchanges its GitHub OIDC token for a short-lived npm token. No long-lived token is stored.
+- A trusted publisher cannot be edited, only revoked and created again. The old binding names `variableland/portless`, which no longer matches the workflow's OIDC claims, so replace it, revoking first because the `npm trust` docs say a new one fails while another exists (interactive 2FA, npm 11.15.0 or later):
 
   ```bash
-  npm trust github @variablelab/portless --file release.yml --repo variableland/portless --env Release --allow-publish
+  # 1. Find the id of the current binding (it names variableland/portless)
+  npm trust list @variablelab/portless
+
+  # 2. Remove it
+  npm trust revoke --id <id> @variablelab/portless
+
+  # 3. Trust the release workflow of the new repository
+  npm trust github @variablelab/portless --file release.yml --repo withvariablelab/portless --env Release --allow-publish
   ```
 
-- The `Release` GitHub environment exists. Add required reviewers there if you want a manual gate before every publish.
-- The `NPM_TOKEN` secret used for the first release (0.0.1) is no longer read by the workflow. Revoke it on npmjs.com and delete the secret after the first successful OIDC publish.
+  Cut a release right after step 3 (see below) to confirm the new binding works. Use the same three steps if the repository, workflow file, or environment ever changes again.
+
+- The `Release` GitHub environment only accepts deployments from `main` (deployment branches: selected branches, `main`). The trusted publisher is bound to this environment, so a `release.yml` run dispatched from any other branch is rejected before it can request an npm token. Keep that restriction if you recreate the environment, and add required reviewers there if you want a manual gate before every publish.
+- No npm token is stored anywhere. The `NPM_TOKEN` secret used for the first release (0.0.1) is gone from the repository; if a token from that release still exists on npmjs.com, revoke it.
 
 ## Cut a release
 
