@@ -2,9 +2,19 @@
 
 Release notes for `@variablelab/portless`. Upstream's own history is in [CHANGELOG.md](./CHANGELOG.md).
 
-## 0.0.4
+## 0.0.5
 
 <!-- release:start -->
+
+Based on upstream [portless v0.15.6](https://github.com/vercel-labs/portless/releases/tag/v0.15.6) (upstream `main` at `1ad573b`), the same base as 0.0.4.
+
+### Changed
+
+- The repository moved to [withvariablelab/portless](https://github.com/withvariablelab/portless). The package name and the CLI are unchanged.
+
+<!-- release:end -->
+
+## 0.0.4
 
 Based on upstream [portless v0.15.6](https://github.com/vercel-labs/portless/releases/tag/v0.15.6) (upstream `main` at `1ad573b`), the same base as 0.0.3.
 
@@ -15,8 +25,6 @@ Based on upstream [portless v0.15.6](https://github.com/vercel-labs/portless/rel
 ### Changed
 
 - When `routes.json` cannot be read (for example because of file permissions), commands now print a warning on stderr instead of silently treating it as empty.
-
-<!-- release:end -->
 
 ## 0.0.3
 
