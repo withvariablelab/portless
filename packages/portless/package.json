@@ -63,12 +63,12 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/variableland/portless.git",
+    "url": "git+https://github.com/withvariablelab/portless.git",
     "directory": "packages/portless"
   },
-  "homepage": "https://github.com/variableland/portless#readme",
+  "homepage": "https://github.com/withvariablelab/portless#readme",
   "bugs": {
-    "url": "https://github.com/variableland/portless/issues"
+    "url": "https://github.com/withvariablelab/portless/issues"
   },
   "devDependencies": {
     "@types/node": "^24.12.4",

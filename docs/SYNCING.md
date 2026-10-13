@@ -6,13 +6,14 @@ This fork tracks [vercel-labs/portless](https://github.com/vercel-labs/portless)
 - `fix(proxy): route wildcard subdomains to the closest registered parent` (upstream issue [#380](https://github.com/vercel-labs/portless/issues/380), extended to path prefixes)
 - `chore: rename package to @variablelab/portless` (packaging)
 - fork docs, `CHANGELOG.fork.md`, and the release workflow
+- `chore: move the fork to withvariablelab` (repository URLs)
 
 Everything else should be identical to upstream. Keep it that way: the smaller the fork's diff, the cheaper each sync.
 
 ## One-time setup
 
 ```bash
-git clone git@github.com:variableland/portless.git
+git clone git@github.com:withvariablelab/portless.git
 cd portless
 git remote add upstream https://github.com/vercel-labs/portless.git
 git fetch upstream --tags
