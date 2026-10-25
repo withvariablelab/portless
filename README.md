@@ -1,6 +1,6 @@
 # portless
 
-> **This is a fork.** `@variablelab/portless` is [vercel-labs/portless](https://github.com/vercel-labs/portless) plus path-based routing: the `--path` flag, `PORTLESS_PATH`, and the `path` config field, so several apps can share one hostname and be dispatched by URL prefix. That feature is proposed upstream in [PR #165](https://github.com/vercel-labs/portless/pull/165) and is pending review; this package exists so it can be used in the meantime. Everything else is upstream portless, created and maintained by Vercel Labs (see [NOTICE](./NOTICE)). The fork tracks upstream `main` (see [docs/SYNCING.md](./docs/SYNCING.md)) and keeps its own [changelog](./CHANGELOG.fork.md).
+> **This is a fork.** `@variablelab/portless` is [vercel-labs/portless](https://github.com/vercel-labs/portless) plus path-based routing: the `--path` flag, `PORTLESS_PATH`, and the `path` config field, so several apps can share one hostname and be dispatched by URL prefix. That feature is proposed upstream in [PR #165](https://github.com/vercel-labs/portless/pull/165) and is pending review; this package exists so it can be used in the meantime. Everything else is upstream portless, created and maintained by Vercel Labs (see [NOTICE](./NOTICE)). The fork tracks upstream releases (see [docs/SYNCING.md](./docs/SYNCING.md)) and keeps its own [changelog](./CHANGELOG.fork.md).
 >
 > ```bash
 > npm install -g @variablelab/portless
