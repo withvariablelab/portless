@@ -2202,6 +2202,64 @@ describe("CLI", () => {
       expect(status).toBe(1);
       expect(stderr).toContain("Invalid PORTLESS_PATH");
     });
+
+    it.skipIf(process.platform === "win32")(
+      "records the child process group on the prefixed route, not the hostname's root route",
+      async () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "portless-cli-path-pgid-"));
+        let proxyChild: ReturnType<typeof spawn> | undefined;
+        try {
+          const proxy = await startMockProxy(tmpDir);
+          proxyChild = proxy.child;
+          fs.writeFileSync(path.join(tmpDir, "proxy.port"), proxy.port.toString());
+          const routesPath = path.join(tmpDir, "routes.json");
+          // Another live process already serves the root of the same hostname.
+          fs.writeFileSync(
+            routesPath,
+            JSON.stringify([{ hostname: "myapp.localhost", port: 4001, pid: process.pid }])
+          );
+
+          // The child waits for portless to record its process group, then
+          // captures the route table.
+          const capturePath = path.join(tmpDir, "routes-capture.json");
+          const scriptPath = path.join(tmpDir, "capture-routes.js");
+          fs.writeFileSync(
+            scriptPath,
+            [
+              'const fs = require("node:fs");',
+              "const read = () => {",
+              `  try { return JSON.parse(fs.readFileSync(${JSON.stringify(routesPath)}, "utf-8")); }`,
+              "  catch { return []; }",
+              "};",
+              "const deadline = Date.now() + 5000;",
+              "let routes = read();",
+              "while (!routes.some((r) => r.childPgid) && Date.now() < deadline) {",
+              "  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);",
+              "  routes = read();",
+              "}",
+              `fs.writeFileSync(${JSON.stringify(capturePath)}, JSON.stringify(routes));`,
+            ].join("\n") + "\n"
+          );
+
+          const { status } = run(["run", "--name", "myapp", "--path", "/api", "node", scriptPath], {
+            env: { PORTLESS_STATE_DIR: tmpDir, PORTLESS_HTTPS: "0" },
+          });
+
+          expect(status).toBe(0);
+          const routes = JSON.parse(fs.readFileSync(capturePath, "utf-8")) as Array<{
+            pathPrefix?: string;
+            childPgid?: number;
+          }>;
+          expect(routes.find((r) => r.pathPrefix === "/api")?.childPgid).toEqual(
+            expect.any(Number)
+          );
+          expect(routes.filter((r) => !r.pathPrefix).map((r) => r.childPgid)).toEqual([undefined]);
+        } finally {
+          if (proxyChild) await stopChild(proxyChild);
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+      }
+    );
   });
 
   describe("run --name flag", () => {

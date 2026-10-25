@@ -1747,7 +1747,7 @@ async function runApp(
       const childStartTime = getProcessStartTime(pid) ?? undefined;
       for (const host of hostnames) {
         try {
-          store.updateRoute(host, { childPgid: pid, childStartTime });
+          store.updateRoute(host, { childPgid: pid, childStartTime }, pathPrefix);
         } catch {
           // Without the pgid, prune falls back to the route port; non-fatal
         }
