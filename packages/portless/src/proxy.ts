@@ -283,10 +283,8 @@ function findRoute(
   // The closest parent owns the request like an exact match would: path
   // selection never falls through to a farther parent, so routes.json order
   // cannot mix apps.
-  const parentHostname = findMostSpecificParent(routes, hostname)?.hostname.toLowerCase();
-  return parentHostname
-    ? pickByPath(routes.filter((r) => r.hostname.toLowerCase() === parentHostname))
-    : undefined;
+  const parent = findMostSpecificParent(routes, hostname)?.hostname.toLowerCase();
+  return parent ? pickByPath(routes.filter((r) => r.hostname.toLowerCase() === parent)) : undefined;
 }
 
 /**

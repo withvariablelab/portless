@@ -29,9 +29,9 @@ Merge, do not rebase: `main` is public and its history must stay stable. Sync to
 git checkout main
 git pull origin main
 git fetch upstream --tags
-git tag -l 'v*' --sort=-v:refname | head -1   # the latest upstream release, e.g. v0.15.11
-git checkout -b sync/upstream-v0.15.11
-git merge v0.15.11
+TAG=$(gh release view --repo vercel-labs/portless --json tagName --jq .tagName)
+git checkout -b sync/upstream-$TAG
+git merge $TAG
 ```
 
 Resolve conflicts (see below), then run the full pipeline before opening a PR:
@@ -76,11 +76,11 @@ Some breaks are not conflicts, because upstream's new code merges cleanly next t
 
 Do not modify `CHANGELOG.md` or `LICENSE`: both stay upstream's. The fork's release notes live in `CHANGELOG.fork.md`.
 
-To see exactly what the fork changes relative to the upstream release it tracks:
+To see exactly what the fork changes relative to the upstream release it tracks (`TAG`, the one the latest `CHANGELOG.fork.md` entry names):
 
 ```bash
-git diff v0.15.11...main --stat
-git diff v0.15.11...main -- packages/portless/src
+git diff $TAG...main --stat
+git diff $TAG...main -- packages/portless/src
 ```
 
 ## If upstream merges PR #165
