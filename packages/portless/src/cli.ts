@@ -16,12 +16,14 @@ import {
 } from "./hosts-sync-auth.js";
 import {
   fixOwnership,
+  formatUptime,
   formatUrl,
   isErrnoException,
   isProcessAlive as isPidAlive,
   normalizePathPrefix,
   parseHostname,
   parseHostnames,
+  parsePort,
 } from "./utils.js";
 import {
   checkHostResolution,
@@ -30,7 +32,7 @@ import {
   cleanHostsFile,
   shouldAutoSyncHosts,
 } from "./hosts.js";
-import { FILE_MODE, RouteConflictError, RouteStore } from "./routes.js";
+import { FILE_MODE, RouteConflictError, RouteStore, type RouteMapping } from "./routes.js";
 import {
   ensureTailscaleReady,
   findAvailableServePort,
@@ -40,7 +42,8 @@ import {
   registerServe,
   unregisterTailscale,
 } from "./tailscale.js";
-import { ensureNgrokAvailable, startNgrok, stopNgrok, stopNgrokProcess } from "./ngrok.js";
+import { ensureNgrokAvailable, startNgrok, stopNgrokProcess, stopTunnelPid } from "./tunnel.js";
+import { ensureCloudflaredAvailable, startCloudflare } from "./cloudflare.js";
 import {
   inferProjectName,
   detectWorktreePrefix,
@@ -60,7 +63,11 @@ import {
   discoverState,
   findFreePort,
   findPidOnPort,
+  guardWindowsOrphans,
   findPidsOnPort,
+  killOrphanedProcessGroup,
+  getProcessStartTime,
+  getProcessCommand,
   getDefaultPort,
   getDefaultTlds,
   getProxyBindTargets,
@@ -121,7 +128,7 @@ import {
   loadPackagePortlessConfig,
   ConfigValidationError,
 } from "./config.js";
-import type { AppConfig } from "./config.js";
+import type { AppConfig, LoadedConfig } from "./config.js";
 import { findWorkspaceRoot, discoverWorkspacePackages } from "./workspace.js";
 import type { WorkspacePackage } from "./workspace.js";
 import {
@@ -538,6 +545,77 @@ function addRoutes(
     throw err;
   }
   return [...new Set(killedPids)];
+}
+
+/**
+ * Stop dev servers left running by portless sessions that died without
+ * cleanup (SIGKILL, crash). Their routes are about to be dropped as stale, and
+ * the stored process group is the only remaining link to the orphaned tree.
+ */
+function stopOrphanedProcessGroups(store: RouteStore): void {
+  const seen = new Set<number>();
+  for (const route of store.loadRoutesRaw()) {
+    if (route.pid === 0 || isPidAlive(route.pid)) continue;
+    for (const t of stopRecordedTunnels(route, true)) {
+      const message = `Stopped orphaned ${t.label} tunnel from a previous session (pid ${route[t.pidField]})`;
+      console.log(colors.yellow(message));
+    }
+    const pgid = route.childPgid;
+    if (!pgid || seen.has(pgid)) continue;
+    seen.add(pgid);
+    if (killOrphanedProcessGroup(pgid, route.childStartTime)) {
+      console.log(
+        colors.yellow(`Stopped orphaned dev server from a previous session (process group ${pgid})`)
+      );
+    }
+  }
+}
+
+const PROCESS_TUNNELS = [
+  {
+    label: "ngrok",
+    binary: "ngrok",
+    env: "PORTLESS_NGROK",
+    via: "ngrok",
+    install: "https://ngrok.com/download",
+    urlField: "ngrokUrl",
+    pidField: "ngrokPid",
+    ensure: ensureNgrokAvailable,
+    start: startNgrok,
+  },
+  {
+    label: "Cloudflare",
+    binary: "cloudflared",
+    env: "PORTLESS_CLOUDFLARE",
+    via: "Cloudflare Tunnel",
+    install: "https://developers.cloudflare.com/tunnel/downloads/",
+    urlField: "cloudflareUrl",
+    pidField: "cloudflarePid",
+    ensure: ensureCloudflaredAvailable,
+    start: startCloudflare,
+  },
+] as const;
+
+type ProcessTunnel = (typeof PROCESS_TUNNELS)[number];
+
+/** Stop the tunnel processes recorded on a route; `verify` skips pids not running the tunnel binary. */
+function stopRecordedTunnels(route: RouteMapping, verify = false): ProcessTunnel[] {
+  return PROCESS_TUNNELS.filter((t) => {
+    const pid = route[t.pidField];
+    if (!pid || (verify && getProcessCommand(pid) !== t.binary)) return false;
+    stopTunnelPid(pid);
+    return true;
+  });
+}
+
+/** Print the install or auth hint that matches a tunnel error message. */
+function printTunnelHint(t: ProcessTunnel, message: string): void {
+  if (message.includes(`${t.binary} CLI not found`)) {
+    console.error(colors.blue(`Install ${t.binary}: ${t.install}`));
+  } else if (t.binary === "ngrok" && message.includes("authentication is not configured")) {
+    console.error(colors.blue("Configure ngrok authentication:"));
+    console.error(colors.cyan("  ngrok config add-authtoken <token>"));
+  }
 }
 
 function removeRoutes(
@@ -1082,18 +1160,21 @@ function listRoutes(store: RouteStore, proxyPort: number, tls: boolean): void {
   for (const route of routes) {
     const url = formatUrl(route.hostname, proxyPort, tls, route.pathPrefix);
     const label = route.pid === 0 ? "(alias)" : `(pid ${route.pid})`;
+    const uptime = route.pid === 0 ? null : formatUptime(route.registeredAt, Date.now());
     console.log(
-      `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(`localhost:${route.port}`)}  ${colors.gray(label)}`
+      `  ${colors.cyan(url)}  ${colors.gray("->")}  ${colors.white(`localhost:${route.port}`)}  ${colors.gray(label)}${uptime ? ` ${colors.gray(`up ${uptime}`)}` : ""}`
     );
     if (route.tailscaleUrl) {
       const tsLabel = route.tailscaleFunnel ? "funnel" : "tailscale";
       const tsUrl = `${route.tailscaleUrl}${route.pathPrefix ?? ""}`;
       console.log(`    ${colors.gray(tsLabel + ":")} ${colors.green(tsUrl)}`);
     }
-    if (route.ngrokUrl) {
-      console.log(
-        `    ${colors.gray("ngrok:")} ${colors.green(`${route.ngrokUrl}${route.pathPrefix ?? ""}`)}`
-      );
+    for (const t of PROCESS_TUNNELS) {
+      const tunnelUrl = route[t.urlField];
+      if (tunnelUrl)
+        console.log(
+          `    ${colors.gray(t.label.toLowerCase() + ":")} ${colors.green(`${tunnelUrl}${route.pathPrefix ?? ""}`)}`
+        );
     }
   }
   console.log();
@@ -1302,7 +1383,7 @@ async function runApp(
   // No point starting the proxy if tailscale will fail afterward.
   const wantsFunnel = isEnabledEnv(process.env.PORTLESS_FUNNEL);
   const wantsTailscale = wantsFunnel || isEnabledEnv(process.env.PORTLESS_TAILSCALE);
-  const wantsNgrok = isEnabledEnv(process.env.PORTLESS_NGROK);
+  const tunnels = PROCESS_TUNNELS.filter((t) => isEnabledEnv(process.env[t.env]));
   let tsBaseUrl: string | undefined;
 
   if (wantsTailscale) {
@@ -1325,15 +1406,13 @@ async function runApp(
     }
   }
 
-  if (wantsNgrok) {
+  for (const t of tunnels) {
     try {
-      ensureNgrokAvailable();
+      t.ensure();
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(colors.red(`Error: ${message}`));
-      if (message.includes("not found")) {
-        console.error(colors.blue("Install ngrok: https://ngrok.com/download"));
-      }
+      printTunnelHint(t, message);
       process.exit(1);
     }
   }
@@ -1421,6 +1500,8 @@ async function runApp(
     console.log(colors.green(`-- Using port ${port}`));
   }
 
+  stopOrphanedProcessGroups(store);
+
   // Register route (--force kills the existing owner if any)
   let killedPids: number[] = [];
   try {
@@ -1455,24 +1536,26 @@ async function runApp(
   // Readiness was already checked at the top of runApp().
   let tailscaleHttpsPort: number | undefined;
   let tailscaleUrl: string | undefined;
-  let ngrokUrl: string | undefined;
-  let ngrokProcess: Awaited<ReturnType<typeof startNgrok>> | undefined;
-  let stoppingNgrok = false;
-  let ngrokRouteReady = false;
-  let ngrokExitHandled = false;
-  let pendingNgrokExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+  type TunnelRun = {
+    t: ProcessTunnel;
+    proc?: Awaited<ReturnType<typeof startNgrok>>;
+    ready?: boolean;
+    handled?: boolean;
+    pending?: () => void;
+  };
+  const tunnelRuns = tunnels.map((t): TunnelRun => ({ t }));
+  let stoppingTunnels = false;
 
-  const handleNgrokExit = (code: number | null, signal: NodeJS.Signals | null) => {
-    if (stoppingNgrok || ngrokExitHandled) return;
-    if (!ngrokRouteReady) {
-      pendingNgrokExit = { code, signal };
+  const handleTunnelExit = (run: TunnelRun, code: number | null, signal: NodeJS.Signals | null) => {
+    if (stoppingTunnels || run.handled) return;
+    if (!run.ready) {
+      run.pending = () => handleTunnelExit(run, code, signal);
       return;
     }
-    ngrokExitHandled = true;
-    ngrokUrl = undefined;
+    run.handled = true;
     console.warn(
       colors.yellow(
-        `Warning: ngrok tunnel for ${hostname} stopped${formatProcessExitSuffix(
+        `Warning: ${run.t.label} tunnel for ${hostname} stopped${formatProcessExitSuffix(
           code,
           signal
         )}. Removing its public URL from the route list.`
@@ -1482,8 +1565,8 @@ async function runApp(
       store.updateRoute(
         hostname,
         {
-          ngrokUrl: null,
-          ngrokPid: null,
+          [run.t.urlField]: null,
+          [run.t.pidField]: null,
         },
         pathPrefix
       );
@@ -1544,43 +1627,37 @@ async function runApp(
     }
   }
 
-  if (wantsNgrok) {
+  for (const run of tunnelRuns) {
     try {
-      ngrokProcess = await startNgrok(port, {
+      run.proc = await run.t.start(port, {
         hostHeader: hostname,
-        onExit: handleNgrokExit,
+        onExit: (code, signal) => handleTunnelExit(run, code, signal),
+        configPath: path.join(store.dir, "cloudflared.yml"),
       });
-      ngrokUrl = ngrokProcess.url;
-      console.log(chalk.green(`  ngrok -> ${ngrokUrl}${pathPrefix ?? ""}`));
-      console.log(chalk.gray("  (accessible from the public internet via ngrok)\n"));
+      console.log(chalk.green(`  ${run.t.label} -> ${run.proc.url}${pathPrefix ?? ""}`));
+      console.log(chalk.gray(`  (accessible from the public internet via ${run.t.via})\n`));
 
       try {
         store.updateRoute(
           hostname,
           {
-            ngrokUrl,
-            ngrokPid: ngrokProcess.pid,
+            [run.t.urlField]: run.proc.url,
+            [run.t.pidField]: run.proc.pid,
           },
           pathPrefix
         );
       } catch {
         // Non-fatal: route display metadata only
       } finally {
-        ngrokRouteReady = true;
-        if (pendingNgrokExit) {
-          handleNgrokExit(pendingNgrokExit.code, pendingNgrokExit.signal);
-          pendingNgrokExit = undefined;
-        }
+        run.ready = true;
+        run.pending?.();
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(colors.red(`Error: ${message}`));
-      if (message.includes("not found")) {
-        console.error(colors.blue("Install ngrok: https://ngrok.com/download"));
-      } else if (message.includes("authentication")) {
-        console.error(colors.blue("Configure ngrok authentication:"));
-        console.error(colors.cyan("  ngrok config add-authtoken <token>"));
-      }
+      printTunnelHint(run.t, message);
+      stoppingTunnels = true;
+      for (const started of tunnelRuns) stopNgrokProcess(started.proc?.child);
       try {
         unregisterTailscale({
           tailscaleHttpsPort,
@@ -1645,6 +1722,10 @@ async function runApp(
     )
   );
 
+  for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"] as const) {
+    process.once(signal, () => (stoppingTunnels = true));
+  }
+
   spawnCommand(commandArgs, {
     env: {
       ...process.env,
@@ -1657,12 +1738,24 @@ async function runApp(
       // own LAN discovery natively.
       ...(lanMode ? { PORTLESS_LAN: "1" } : {}),
       ...(tailscaleUrl ? { PORTLESS_TAILSCALE_URL: tailscaleUrl } : {}),
-      ...(ngrokUrl ? { PORTLESS_NGROK_URL: ngrokUrl } : {}),
+      ...Object.fromEntries(
+        tunnelRuns.flatMap((r) => (r.proc && !r.handled ? [[`${r.t.env}_URL`, r.proc.url]] : []))
+      ),
       ...caEnv,
     },
+    onSpawn: (pid) => {
+      const childStartTime = getProcessStartTime(pid) ?? undefined;
+      for (const host of hostnames) {
+        try {
+          store.updateRoute(host, { childPgid: pid, childStartTime });
+        } catch {
+          // Without the pgid, prune falls back to the route port; non-fatal
+        }
+      }
+    },
     onCleanup: () => {
-      stoppingNgrok = true;
-      stopNgrokProcess(ngrokProcess?.child);
+      stoppingTunnels = true;
+      for (const run of tunnelRuns) stopNgrokProcess(run.proc?.child);
       try {
         unregisterTailscale({
           tailscaleHttpsPort,
@@ -1706,8 +1799,8 @@ function parseAppPort(value: string | undefined): number {
     console.error(colors.red("Error: --app-port requires a port number."));
     process.exit(1);
   }
-  const port = parseInt(value, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(value);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid app port "${value}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -1717,8 +1810,8 @@ function parseAppPort(value: string | undefined): number {
 function appPortFromEnv(): number | undefined {
   const envVal = process.env.PORTLESS_APP_PORT;
   if (!envVal) return undefined;
-  const port = parseInt(envVal, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(envVal);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid PORTLESS_APP_PORT="${envVal}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -1760,6 +1853,10 @@ function applySharingFlag(flag: string): boolean {
   }
   if (flag === "--ngrok") {
     process.env.PORTLESS_NGROK = "1";
+    return true;
+  }
+  if (flag === "--cloudflare") {
+    process.env.PORTLESS_CLOUDFLARE = "1";
     return true;
   }
   return false;
@@ -1804,6 +1901,7 @@ ${colors.bold("Options:")}
   --tailscale            Share the app on your Tailscale network (tailnet)
   --funnel               Share the app publicly via Tailscale Funnel
   --ngrok                Share the app publicly via ngrok
+  --cloudflare           Share the app publicly via a Cloudflare quick tunnel (requires cloudflared)
   --help, -h             Show this help
 
 ${colors.bold("Name inference (in order):")}
@@ -1851,7 +1949,7 @@ ${colors.bold("Examples:")}
       console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
       console.error(
         colors.blue(
-          "Known flags: --name, --force, --app-port, --path, --tailscale, --funnel, --ngrok, --help"
+          "Known flags: --name, --force, --app-port, --path, --tailscale, --funnel, --ngrok, --cloudflare, --help"
         )
       );
       process.exit(1);
@@ -1901,7 +1999,9 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else {
       console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
       console.error(
-        colors.blue("Known flags: --force, --app-port, --path, --tailscale, --funnel, --ngrok")
+        colors.blue(
+          "Known flags: --force, --app-port, --path, --tailscale, --funnel, --ngrok, --cloudflare"
+        )
       );
       process.exit(1);
     }
@@ -1935,7 +2035,9 @@ function parseAppArgs(args: string[]): ParsedAppArgs {
     } else {
       console.error(colors.red(`Error: Unknown flag "${args[i]}".`));
       console.error(
-        colors.blue("Known flags: --force, --app-port, --path, --tailscale, --funnel, --ngrok")
+        colors.blue(
+          "Known flags: --force, --app-port, --path, --tailscale, --funnel, --ngrok, --cloudflare"
+        )
       );
       process.exit(1);
     }
@@ -1979,12 +2081,12 @@ ${colors.bold("Usage:")}
   ${colors.cyan("portless get <name>")}              Print URL for a service (for cross-service refs)
   ${colors.cyan("portless alias <name> <port>")}     Register a static route (e.g. for Docker)
   ${colors.cyan("portless alias --remove <name>")}   Remove a static route
-  ${colors.cyan("portless list")}                    Show active routes
+  ${colors.cyan("portless list")}                    Show active routes and uptime
   ${colors.cyan("portless doctor")}                  Check local portless health
   ${colors.cyan("portless trust")}                   Add local CA to system trust store
   ${colors.cyan("portless clean")}                   Remove portless state, trust entry, and hosts block
   ${colors.cyan("portless prune")}                   Kill orphaned dev servers from crashed sessions
-  ${colors.cyan("portless hosts sync")}              Add routes to ${HOSTS_DISPLAY} (fixes Safari)
+  ${colors.cyan("portless hosts sync")}              Reconcile routes with ${HOSTS_DISPLAY} (fixes Safari)
   ${colors.cyan("portless hosts clean")}             Remove portless entries from ${HOSTS_DISPLAY}
 
 ${colors.bold("Examples:")}
@@ -2012,6 +2114,8 @@ ${colors.bold("Configuration (portless.json):")}
   Override name:   { "name": "myapp" }
   Override script: { "name": "myapp", "script": "start" }
   Monorepo:        { "apps": { "apps/web": { "name": "myapp" } } }
+  Turborepo:       Workspace roots use Turbo when turbo.json or turbo.jsonc is readable
+                   Set { "turbo": false } to use direct spawning
 
 ${colors.bold("Path-based routing:")}
   Route multiple apps under one hostname by URL path:
@@ -2051,6 +2155,8 @@ ${colors.bold("How it works:")}
      script, or is invoked with runner flags before the script name
      (bun run --bun dev); set the port in those yourself
   6. The proxy listens only on 127.0.0.1 and ::1 unless LAN mode is enabled
+  7. Proxy errors (404, 502, 508) are an HTML page for browsers and JSON
+     ({"error","upstream","message"}) for clients that do not accept text/html
   Elevated proxy processes keep the invoking user's ~/.portless state directory.
 
 ${colors.bold("HTTP/2 + HTTPS (default):")}
@@ -2109,12 +2215,13 @@ ${colors.bold("Options:")}
   --key <path>                  Use a custom TLS private key
   --foreground                  Run proxy in foreground (for debugging)
   --tld <tld>                   Use a custom TLD instead of .localhost (e.g. test, dev.example.com); repeat for more
-  --wildcard                    Allow unregistered subdomains to fall back to parent route
+  --wildcard                    Allow unregistered subdomains to fall back to the most specific parent route
   --state-dir <path>            Use a custom state directory with service install
   --app-port <number>           Use a fixed port for the app (skip auto-assignment)
   --tailscale                   Share the app on your Tailscale network (tailnet)
   --funnel                      Share the app publicly via Tailscale Funnel
   --ngrok                       Share the app publicly via ngrok
+  --cloudflare                  Share the app publicly via a Cloudflare quick tunnel (requires cloudflared)
   --force                       Kill the existing process and take over its route
   --name <name>                 Use <name> as the app name (bypasses subcommand dispatch)
   --json                        Print JSON (list, get, doctor, service status)
@@ -2127,11 +2234,12 @@ ${colors.bold("Environment variables:")}
   PORTLESS_LAN=1                Enable LAN mode when set to 1 (set in .bashrc / .zshrc)
   PORTLESS_LAN_IP=<address>     Pin a specific LAN IP for LAN mode
   PORTLESS_TLD=<tld>[,<tld>]    Use one or more TLDs (e.g. localhost,test,dev.example.com)
-  PORTLESS_WILDCARD=1           Allow unregistered subdomains to fall back to parent route
+  PORTLESS_WILDCARD=1           Allow unregistered subdomains to fall back to the most specific parent route
   PORTLESS_SYNC_HOSTS=0         Disable auto-sync of ${HOSTS_DISPLAY} (on by default)
   PORTLESS_TAILSCALE=1          Share apps on your Tailscale network (same as --tailscale)
   PORTLESS_FUNNEL=1             Share apps publicly via Tailscale Funnel (same as --funnel)
   PORTLESS_NGROK=1              Share apps publicly via ngrok (same as --ngrok)
+  PORTLESS_CLOUDFLARE=1         Share apps publicly via Cloudflare (same as --cloudflare)
   PORTLESS_STATE_DIR=<path>     Override the state directory
   PORTLESS_PATH=<path>          Path prefix for path-based routing (e.g. /api)
   PORTLESS=0                    Run command directly without proxy
@@ -2143,6 +2251,7 @@ ${colors.bold("Child process environment:")}
   PORTLESS_LAN                  Set to 1 when proxy is in LAN mode
   PORTLESS_TAILSCALE_URL        Tailscale URL of the app (when --tailscale is active)
   PORTLESS_NGROK_URL            ngrok URL of the app (when --ngrok is active)
+  PORTLESS_CLOUDFLARE_URL       Cloudflare URL of the app (when --cloudflare is active)
   NODE_EXTRA_CA_CERTS           Path to the portless CA (set when HTTPS is active)
 
 ${colors.bold("Safari / DNS:")}
@@ -2151,7 +2260,10 @@ ${colors.bold("Safari / DNS:")}
   Auto-syncs ${HOSTS_DISPLAY} for route hostnames by default (including .localhost,
   custom TLDs, and LAN .local). Set PORTLESS_SYNC_HOSTS=0 to disable. If a route
   hostname will not resolve, the command that registered it warns instead of
-  failing silently. To sync manually:
+  failing silently. Manual sync reconciles the managed entries with current routes,
+  removes stale entries when there are no routes, and requires a successful read
+  before writing. Every write is verified; a failed verification uses the normal
+  hosts sync failure path. To sync manually:
     ${colors.cyan("portless hosts sync")}
   Clean up later with:
     ${colors.cyan("portless hosts clean")}
@@ -2173,13 +2285,24 @@ function printVersion(): void {
 }
 
 async function handleTrust(): Promise<void> {
-  const { dir } = await discoverState();
+  const { dir, port, tls } = await discoverState();
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }
   const { caGenerated } = ensureCerts(dir);
   if (caGenerated) {
     console.log(colors.gray("Generated local CA certificate."));
+    // A running proxy keeps the previous CA and the TLS contexts it already
+    // built in memory, so it presents the old chain until it restarts.
+    if (await isProxyRunning(port, tls)) {
+      const portFlag = port !== getDefaultPort(tls) ? ` -p ${port}` : "";
+      console.log(
+        colors.yellow("The running proxy still serves certificates from the previous CA.")
+      );
+      console.log(
+        colors.blue(`Restart it: portless proxy stop${portFlag} && portless proxy start${portFlag}`)
+      );
+    }
   }
   const result = trustCA(dir);
   if (result.trusted) {
@@ -2288,9 +2411,8 @@ ${colors.bold("Options:")}
         // Tailscale may not be installed; non-fatal
       }
     }
-    if (route.ngrokPid) {
-      stopNgrok(route);
-      console.log(colors.green(`Stopped ngrok tunnel for ${route.hostname}.`));
+    for (const t of stopRecordedTunnels(route)) {
+      console.log(colors.green(`Stopped ${t.label} tunnel for ${route.hostname}.`));
     }
   }
 
@@ -2386,14 +2508,29 @@ ${colors.bold("Options:")}
         // Tailscale CLI may not be installed; non-fatal during prune
       }
     }
-    if (route.ngrokPid) {
-      stopNgrok(route);
-      console.log(`  ${route.hostname} - stopped ngrok tunnel`);
+    for (const t of stopRecordedTunnels(route)) {
+      console.log(`  ${route.hostname} - stopped ${t.label} tunnel`);
     }
   }
 
   let killed = 0;
+  const signal = forceKill ? "SIGKILL" : "SIGTERM";
+  const killedGroups = new Set<number>();
   for (const route of stale) {
+    const pgid = route.childPgid;
+    if (
+      pgid &&
+      !killedGroups.has(pgid) &&
+      killOrphanedProcessGroup(pgid, route.childStartTime, signal)
+    ) {
+      killedGroups.add(pgid);
+      killed++;
+      console.log(`  ${route.hostname} - killed process group ${pgid} (${signal})`);
+    }
+  }
+
+  for (const route of stale) {
+    if (route.childPgid && killedGroups.has(route.childPgid)) continue;
     const pids = findPidsOnPort(route.port);
     if (pids.length === 0) {
       console.log(
@@ -2401,7 +2538,6 @@ ${colors.bold("Options:")}
       );
       continue;
     }
-    const signal = forceKill ? "SIGKILL" : "SIGTERM";
     for (const pid of pids) {
       try {
         process.kill(pid, signal);
@@ -2579,8 +2715,8 @@ ${colors.bold("Examples:")}
   }
 
   const hostnames = buildHostnames(aliasName, tlds);
-  const port = parseInt(aliasPort, 10);
-  if (isNaN(port) || port < 1 || port > 65535) {
+  const port = parsePort(aliasPort);
+  if (port === null) {
     console.error(colors.red(`Error: Invalid port "${aliasPort}". Must be 1-65535.`));
     process.exit(1);
   }
@@ -2613,16 +2749,21 @@ async function handleHosts(args: string[]): Promise<void> {
 ${colors.bold("portless hosts")} - Manage ${HOSTS_DISPLAY} entries for .localhost subdomains.
 
 Safari relies on the system DNS resolver, which may not handle .localhost
-subdomains. This command adds entries to ${HOSTS_DISPLAY} as a workaround.
+subdomains. This command reconciles portless-managed entries in ${HOSTS_DISPLAY}.
 
 ${colors.bold("Usage:")}
-  ${colors.cyan("portless hosts sync")}    Add current routes to ${HOSTS_DISPLAY}
+  ${colors.cyan("portless hosts sync")}    Reconcile current routes with ${HOSTS_DISPLAY}
   ${colors.cyan("portless hosts clean")}   Remove portless entries from ${HOSTS_DISPLAY}
 
 ${colors.bold("Auto-sync:")}
   The proxy updates ${HOSTS_DISPLAY} for route hostnames by default. Disable with
   PORTLESS_SYNC_HOSTS=0. If a route hostname will not resolve, the command that
   registered it warns instead of failing silently.
+
+${colors.bold("Safety:")}
+  Sync removes stale entries when there are no routes. It requires a successful
+  hosts-file read before writing and verifies every write. Read or verification
+  failures use the normal elevated privileges or error path.
 `);
     process.exit(0);
   }
@@ -2661,7 +2802,7 @@ ${colors.bold("Auto-sync:")}
     console.log(`
 ${colors.bold("Usage: portless hosts <command>")}
 
-  ${colors.cyan("portless hosts sync")}    Add current routes to ${HOSTS_DISPLAY}
+  ${colors.cyan("portless hosts sync")}    Reconcile current routes with ${HOSTS_DISPLAY}
   ${colors.cyan("portless hosts clean")}   Remove portless entries from ${HOSTS_DISPLAY}
 `);
     process.exit(0);
@@ -2670,7 +2811,7 @@ ${colors.bold("Usage: portless hosts <command>")}
   if (args[1] !== "sync") {
     console.error(colors.red(`Error: Unknown hosts subcommand "${args[1]}".`));
     console.error(colors.blue("Usage:"));
-    console.error(colors.cyan(`  portless hosts sync    # Add routes to ${HOSTS_DISPLAY}`));
+    console.error(colors.cyan(`  portless hosts sync    # Reconcile routes with ${HOSTS_DISPLAY}`));
     console.error(colors.cyan("  portless hosts clean   # Remove portless entries"));
     process.exit(1);
   }
@@ -2681,20 +2822,12 @@ ${colors.bold("Usage: portless hosts <command>")}
   });
 
   const routes = store.loadRoutes();
-  if (routes.length === 0) {
-    // Zero routes is a desired state, not a no-op: bailing here would leave a
-    // block whose routes are gone, in the command the warning tells users to run.
-    if (getManagedHostnames().length === 0) {
-      console.log(colors.yellow("No active routes to sync."));
-      return;
-    }
-    if (syncHostsFile([])) {
-      console.log(colors.green(`Removed stale portless entries from ${HOSTS_DISPLAY}.`));
-      return;
-    }
-  }
   const hostnames = [...new Set(routes.map((r) => r.hostname))];
   if (syncHostsFile(hostnames)) {
+    if (hostnames.length === 0) {
+      console.log(colors.green(`No stale portless entries remain in ${HOSTS_DISPLAY}.`));
+      return;
+    }
     console.log(colors.green(`Synced ${hostnames.length} hostname(s) to ${HOSTS_DISPLAY}:`));
     for (const h of hostnames) {
       console.log(colors.cyan(`  127.0.0.1 ${h}`));
@@ -3149,10 +3282,13 @@ async function handleProxy(args: string[]): Promise<void> {
     if (portIdx !== -1) {
       const portValue = args[portIdx + 1];
       if (portValue && !portValue.startsWith("-")) {
-        const parsed = parseInt(portValue, 10);
-        if (!isNaN(parsed) && parsed >= 1 && parsed <= 65535) {
-          explicitPort = parsed;
+        const parsed = parsePort(portValue);
+        if (parsed === null) {
+          console.error(colors.red(`Error: Invalid port number: ${portValue}`));
+          console.error(colors.blue("Port must be between 1 and 65535."));
+          process.exit(1);
         }
+        explicitPort = parsed;
       }
     }
 
@@ -3251,12 +3387,13 @@ ${colors.bold("LAN mode (--lan):")}
       console.error(colors.cyan("  portless proxy start -p 8080"));
       process.exit(1);
     }
-    proxyPort = parseInt(portValue, 10);
-    if (isNaN(proxyPort) || proxyPort < 1 || proxyPort > 65535) {
+    const parsed = parsePort(portValue);
+    if (parsed === null) {
       console.error(colors.red(`Error: Invalid port number: ${portValue}`));
       console.error(colors.blue("Port must be between 1 and 65535."));
       process.exit(1);
     }
+    proxyPort = parsed;
     hasExplicitPort = true;
   }
 
@@ -3691,15 +3828,18 @@ ${colors.bold("LAN mode (--lan):")}
   }
 }
 
+type AppConfigWithSource = AppConfig & { source: LoadedConfig["source"] };
+
 /**
- * Load the effective AppConfig for the current directory from portless.json.
+ * Load the effective AppConfig for the current directory from portless.json or
+ * the package.json "portless" key, tagged with the file it came from.
  * Handles both single-app (top-level fields) and monorepo (apps map) configs.
  */
-function loadAppConfig(cwd: string = process.cwd()): AppConfig | null {
+function loadAppConfig(cwd: string = process.cwd()): AppConfigWithSource | null {
   try {
     const loaded = loadConfig(cwd);
     if (!loaded) return null;
-    return resolveAppConfig(loaded.config, loaded.configDir, cwd);
+    return { ...resolveAppConfig(loaded.config, loaded.configDir, cwd), source: loaded.source };
   } catch (err) {
     if (err instanceof ConfigValidationError) {
       console.error(colors.red(`Error: ${err.message}`));
@@ -3764,7 +3904,7 @@ async function handleDefaultMode(
 async function handleDefaultSingle(
   cwd: string,
   scriptName: string,
-  appConfig: AppConfig | null
+  appConfig: AppConfigWithSource | null
 ): Promise<void> {
   const resolved = resolveScriptCommand(scriptName, cwd);
   if (!resolved) {
@@ -3780,7 +3920,7 @@ async function handleDefaultSingle(
       .split(".")
       .map((label) => truncateLabel(label))
       .join(".");
-    nameSource = "portless.json";
+    nameSource = appConfig.source;
   } else {
     const inferred = inferProjectName(cwd);
     baseName = inferred.name;
@@ -4226,6 +4366,7 @@ async function runWithTurbo(
         ? ["bunx", "turbo", "run", scriptName, ...extraArgs]
         : [pm, "exec", "turbo", "run", scriptName, ...extraArgs];
 
+  const turboSpawnedAt = Date.now();
   const turboChild = spawn(turboArgs[0], turboArgs.slice(1), {
     stdio: "inherit",
     cwd: wsRoot,
@@ -4235,6 +4376,7 @@ async function runWithTurbo(
     },
     ...(isWindows ? {} : { detached: true }),
   });
+  guardWindowsOrphans(turboChild, turboSpawnedAt);
 
   const SIGKILL_TIMEOUT_MS = 5_000;
 
@@ -4258,6 +4400,7 @@ async function runWithTurbo(
 
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+  process.on("SIGHUP", cleanup);
 
   const exitCode = await new Promise<number | null>((resolve) => {
     turboChild.on("exit", (code) => resolve(code));
@@ -4342,6 +4485,7 @@ async function runWithDirectSpawn(
 
   process.on("SIGINT", cleanup);
   process.on("SIGTERM", cleanup);
+  process.on("SIGHUP", cleanup);
 
   await Promise.all(
     children.map(
@@ -4401,7 +4545,7 @@ async function handleRunMode(args: string[], globalScript?: string): Promise<voi
       .split(".")
       .map((label) => truncateLabel(label))
       .join(".");
-    nameSource = "portless.json";
+    nameSource = appConfig.source;
   } else {
     const inferred = inferProjectName();
     baseName = inferred.name;
@@ -4520,7 +4664,14 @@ async function main() {
     process.exit(1);
   }
 
-  const globalBooleanFlags = new Set(["--lan", "--tailscale", "--funnel", "--ngrok", "--json"]);
+  const globalBooleanFlags = new Set([
+    "--lan",
+    "--tailscale",
+    "--funnel",
+    "--ngrok",
+    "--cloudflare",
+    "--json",
+  ]);
   const globalValueFlags = new Set(["--ip", INTERNAL_LAN_IP_FLAG, "--script"]);
   const childlessCommands = new Set([
     "--help",
@@ -4638,6 +4789,9 @@ async function main() {
   }
   if (stripGlobalFlag("--ngrok", false)) {
     process.env.PORTLESS_NGROK = "1";
+  }
+  if (stripGlobalFlag("--cloudflare", false)) {
+    process.env.PORTLESS_CLOUDFLARE = "1";
   }
 
   // --script flag: override the default "dev" script for zero-arg mode.

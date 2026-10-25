@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RouteInfo } from "./types.js";
-import { fixOwnership, isErrnoException } from "./utils.js";
+import { fixOwnership, isErrnoException, isProcessAlive as isPidAlive } from "./utils.js";
 
 /** How long (ms) before a lock directory is considered stale and forcibly removed. */
 const STALE_LOCK_THRESHOLD_MS = 10_000;
@@ -23,19 +23,29 @@ export const DIR_MODE = 0o755;
 
 export interface RouteMapping extends RouteInfo {
   pid: number;
+  /** Process group of the command portless spawned for this route. */
+  childPgid?: number;
+  /** Start time of the process group leader, as reported by `ps`. */
+  childStartTime?: string;
   tailscaleUrl?: string;
   tailscaleHttpsPort?: number;
   tailscaleFunnel?: boolean;
   ngrokUrl?: string;
   ngrokPid?: number;
+  cloudflareUrl?: string;
+  cloudflarePid?: number;
 }
 
 type RouteMetadataPatch = {
+  childPgid?: number | null;
+  childStartTime?: string | null;
   tailscaleUrl?: string | null;
   tailscaleHttpsPort?: number | null;
   tailscaleFunnel?: boolean | null;
   ngrokUrl?: string | null;
   ngrokPid?: number | null;
+  cloudflareUrl?: string | null;
+  cloudflarePid?: number | null;
 };
 
 /** Runtime check that a parsed JSON value is a valid RouteMapping. */
@@ -61,8 +71,10 @@ export class RouteConflictError extends Error {
 
   constructor(hostname: string, existingPid: number, pathPrefix?: string) {
     super(
-      `"${hostname}${pathPrefix ?? ""}" is already registered by a running process (PID ${existingPid}). ` +
-        `Use --force to override.`
+      existingPid === 0
+        ? `"${hostname}${pathPrefix ?? ""}" is a static alias. Use --force to replace it; re-add the alias with "portless alias" afterwards.`
+        : `"${hostname}${pathPrefix ?? ""}" is already registered by a running process (PID ${existingPid}). ` +
+            `Use --force to override.`
     );
     this.name = "RouteConflictError";
     this.hostname = hostname;
@@ -163,12 +175,7 @@ export class RouteStore {
   // ---------------------------------------------------------------------------
 
   private isProcessAlive(pid: number): boolean {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
+    return pid === 0 || isPidAlive(pid);
   }
 
   /**
@@ -242,20 +249,23 @@ export class RouteStore {
     try {
       const routes = this.loadRoutes(true);
       const existing = routes.find((r) => this.matchesRoute(r, hostname, pathPrefix));
-      if (existing && existing.pid !== pid && this.isProcessAlive(existing.pid)) {
+      const isAlias = existing?.pid === 0;
+      if (existing && existing.pid !== pid && (isAlias || this.isProcessAlive(existing.pid))) {
         if (!force) {
           throw new RouteConflictError(hostname, existing.pid, pathPrefix);
         }
-        // --force: kill the existing process before taking over
-        try {
-          process.kill(existing.pid, "SIGTERM");
-          killedPid = existing.pid;
-        } catch {
-          // Process may have exited between the check and the kill; non-fatal
+        // --force: kill the existing process before taking over; an alias has none
+        if (!isAlias) {
+          try {
+            process.kill(existing.pid, "SIGTERM");
+            killedPid = existing.pid;
+          } catch {
+            // Process may have exited between the check and the kill; non-fatal
+          }
         }
       }
       const filtered = routes.filter((r) => !this.matchesRoute(r, hostname, pathPrefix));
-      const entry: RouteMapping = { hostname, port, pid };
+      const entry: RouteMapping = { hostname, port, pid, registeredAt: Date.now() };
       if (pathPrefix) entry.pathPrefix = pathPrefix;
       filtered.push(entry);
       this.saveRoutes(filtered);
@@ -337,6 +347,14 @@ export class RouteStore {
       const routes = this.loadRoutes(true);
       const route = routes.find((r) => this.matchesRoute(r, hostname, pathPrefix));
       if (!route) return;
+      if ("childPgid" in fields) {
+        if (fields.childPgid === null) delete route.childPgid;
+        else if (fields.childPgid !== undefined) route.childPgid = fields.childPgid;
+      }
+      if ("childStartTime" in fields) {
+        if (fields.childStartTime === null) delete route.childStartTime;
+        else if (fields.childStartTime !== undefined) route.childStartTime = fields.childStartTime;
+      }
       if ("tailscaleUrl" in fields) {
         if (fields.tailscaleUrl === null) delete route.tailscaleUrl;
         else if (fields.tailscaleUrl !== undefined) route.tailscaleUrl = fields.tailscaleUrl;
@@ -358,6 +376,14 @@ export class RouteStore {
       if ("ngrokPid" in fields) {
         if (fields.ngrokPid === null) delete route.ngrokPid;
         else if (fields.ngrokPid !== undefined) route.ngrokPid = fields.ngrokPid;
+      }
+      if ("cloudflareUrl" in fields) {
+        if (fields.cloudflareUrl === null) delete route.cloudflareUrl;
+        else if (fields.cloudflareUrl !== undefined) route.cloudflareUrl = fields.cloudflareUrl;
+      }
+      if ("cloudflarePid" in fields) {
+        if (fields.cloudflarePid === null) delete route.cloudflarePid;
+        else if (fields.cloudflarePid !== undefined) route.cloudflarePid = fields.cloudflarePid;
       }
       this.saveRoutes(routes);
     } finally {

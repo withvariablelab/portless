@@ -10,7 +10,7 @@ import { execFileSync, execSync, spawn } from "node:child_process";
 import { HOSTS_SYNC_PATH, PORTLESS_HEADER } from "./proxy.js";
 import { checkHostResolution, getManagedHostnames, syncHostsFile } from "./hosts.js";
 import { resolveScript, resolveScriptRaw } from "./config.js";
-import { createLoopbackConnection, resolveUserHome } from "./utils.js";
+import { createLoopbackConnection, parsePort, resolveUserHome } from "./utils.js";
 import {
   HOSTS_SYNC_AUTH_CHALLENGE_HEADER,
   HOSTS_SYNC_AUTH_HEADER,
@@ -196,11 +196,7 @@ function signalTrackedProcesses(
 ): void {
   if (isWindows) {
     for (const { pid } of tracked.values()) {
-      try {
-        process.kill(pid, signal);
-      } catch {
-        // Already dead
-      }
+      killWindowsTree(pid);
     }
     return;
   }
@@ -236,10 +232,119 @@ export function listenOnProxyInterface(
 }
 
 /**
+ * Kill a process and all of its descendants on Windows. Windows has no process
+ * groups, and child.kill() only terminates the cmd.exe wrapper, which leaves
+ * the dev server running and attached to the console.
+ */
+function killWindowsTree(pid: number): void {
+  try {
+    execFileSync("taskkill", ["/T", "/F", "/PID", String(pid)], {
+      stdio: "ignore",
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+      windowsHide: true,
+    });
+  } catch {
+    // Already dead
+  }
+}
+
+/**
+ * Kill the command's descendants if this process dies without running its own
+ * cleanup, such as when it is terminated with `taskkill /F`. Windows does not
+ * end children with their parent, and the cmd.exe wrapper can exit alongside
+ * us, so a detached watcher walks ParentProcessId links from the wrapper pid
+ * (which survive the parent's exit) and checks creation times so a reused pid
+ * is never killed.
+ */
+/**
+ * Pids from `[pid, parentPid, createdAtMs]` rows that belong to the tree rooted
+ * at `root`. A pid is only ours if its creation time fits the lineage: the root
+ * was created before the watcher started, and every descendant after its
+ * parent. A process holding the root pid that was created later is a reuse; it
+ * and anything created after it are left alone. Runs inside the watcher script,
+ * so it must stay self-contained.
+ */
+export function ownedProcessIds(
+  rows: ReadonlyArray<readonly [number, number, number]>,
+  root: number,
+  watcherStartedAt: number
+): number[] {
+  const rootRow = rows.find(([pid]) => pid === root);
+  const impostorAt = rootRow && rootRow[2] > watcherStartedAt ? rootRow[2] : Infinity;
+  const created = new Map<number, number>();
+  if (rootRow && impostorAt === Infinity) created.set(root, rootRow[2]);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const [pid, ppid, at] of rows) {
+      if (created.has(pid) || pid === root) continue;
+      const parentAt = created.get(ppid);
+      const ok = ppid === root ? at < impostorAt : parentAt !== undefined && at >= parentAt;
+      if (ok) {
+        created.set(pid, at);
+        grew = true;
+      }
+    }
+  }
+  return [...created.keys()];
+}
+
+function watchParentOnWindows(
+  childPid: number,
+  spawnedAt: number
+): ReturnType<typeof spawn> | undefined {
+  const script = `
+    const { spawnSync } = require("child_process");
+    const [parent, root, since] = process.argv.slice(1).map(Number);
+    const alive = (pid) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const watcherStartedAt = Date.now();
+    const ownedProcessIds = ${ownedProcessIds.toString()};
+    const descendants = () => {
+      const ps = "Get-CimInstance Win32_Process | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId, $_.ParentProcessId, ([DateTimeOffset]$_.CreationDate).ToUnixTimeMilliseconds() }";
+      const out = spawnSync("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", ps], { encoding: "utf8", windowsHide: true, timeout: ${PID_LOOKUP_TIMEOUT_MS} }).stdout || "";
+      const rows = out.trim().split(/\\r?\\n/).map((l) => l.trim().split(" ").map(Number)).filter((r) => r.length === 3 && r[2] >= since);
+      return ownedProcessIds(rows, root, watcherStartedAt);
+    };
+    const timer = setInterval(() => {
+      if (alive(parent)) {
+        if (!alive(root)) process.exit(0);
+        return;
+      }
+      clearInterval(timer);
+      for (const pid of descendants()) spawnSync("taskkill", ["/F", "/PID", String(pid)], { stdio: "ignore", windowsHide: true, timeout: ${PID_LOOKUP_TIMEOUT_MS} });
+      process.exit(0);
+    }, 500);
+  `;
+  try {
+    // Run outside the user's cwd so the watcher never holds that directory open.
+    const watcher = spawn(
+      process.execPath,
+      ["-e", script, String(process.pid), String(childPid), String(spawnedAt)],
+      { cwd: path.dirname(process.execPath), detached: true, stdio: "ignore", windowsHide: true }
+    );
+    watcher.unref();
+    return watcher;
+  } catch {
+    // Best effort; normal shutdown still kills the tree.
+    return undefined;
+  }
+}
+
+/**
+ * On Windows, kill `child`'s tree if portless is force-killed before cleanup
+ * runs. `spawnedAt` is taken just before spawning `child`. No-op elsewhere.
+ * The watcher is only needed if we die without cleanup; it stops on a normal
+ * exit.
+ */
+export function guardWindowsOrphans(child: ReturnType<typeof spawn>, spawnedAt: number): void {
+  const watcher = isWindows && child.pid ? watchParentOnWindows(child.pid, spawnedAt) : undefined;
+  if (watcher) process.once("exit", () => watcher.kill());
+}
+
+/**
  * Kill a child process and its entire process tree. On Unix, when the child
  * was spawned with `detached: true`, it leads its own process group and
- * process.kill(-pid) reaches every descendant. Falls back to killing just
- * the child on Windows or when the group kill fails.
+ * process.kill(-pid) reaches every descendant. On Windows, taskkill /T walks
+ * the tree. Falls back to killing just the child when neither is possible.
  */
 export function killTree(
   child: ReturnType<typeof spawn>,
@@ -249,13 +354,15 @@ export function killTree(
     child.kill(signal);
     return;
   }
-  if (!isWindows) {
-    try {
-      process.kill(-child.pid, signal);
-      return;
-    } catch {
-      // Process group may already be gone; fall through
-    }
+  if (isWindows) {
+    killWindowsTree(child.pid);
+    return;
+  }
+  try {
+    process.kill(-child.pid, signal);
+    return;
+  } catch {
+    // Process group may already be gone; fall through
   }
   try {
     child.kill(signal);
@@ -306,8 +413,8 @@ export function getProtocolPort(tls: boolean): number {
 export function getDefaultPort(tls?: boolean): number {
   const envPort = process.env.PORTLESS_PORT;
   if (envPort) {
-    const port = parseInt(envPort, 10);
-    if (!isNaN(port) && port >= 1 && port <= 65535) return port;
+    const port = parsePort(envPort);
+    if (port !== null) return port;
   }
   return tls === undefined ? FALLBACK_PROXY_PORT : getProtocolPort(tls);
 }
@@ -860,6 +967,13 @@ export async function discoverState(): Promise<{
 // ---------------------------------------------------------------------------
 
 /**
+ * Addresses an app port must be free on. A bind on one address does not see a
+ * listener on another (on macOS a hostless bind succeeds while 127.0.0.1 or
+ * 0.0.0.0 holds the port), and the proxy dials apps on both loopbacks.
+ */
+const APP_PORT_PROBE_HOSTS = ["127.0.0.1", "::1", "0.0.0.0", "::"];
+
+/**
  * Find a free port in the given range (default 4000-4999).
  * Tries random ports first for speed, then falls back to sequential scan.
  *
@@ -875,14 +989,25 @@ export async function findFreePort(
     throw new Error(`minPort (${minPort}) must be <= maxPort (${maxPort})`);
   }
 
-  const tryPort = (port: number): Promise<boolean> => {
+  const isFreeOn = (port: number, host: string): Promise<boolean> => {
     return new Promise((resolve) => {
       const server = net.createServer();
-      server.listen(port, () => {
+      server.once("error", (err: NodeJS.ErrnoException) => {
+        // A missing address family (IPv4-only or IPv6-only host) cannot hold the port.
+        resolve(err.code === "EADDRNOTAVAIL" || err.code === "EAFNOSUPPORT");
+      });
+      server.listen(port, host, () => {
         server.close(() => resolve(true));
       });
-      server.on("error", () => resolve(false));
     });
+  };
+
+  // Probe sequentially: a dual-stack `::` bind collides with a concurrent `0.0.0.0` one.
+  const tryPort = async (port: number): Promise<boolean> => {
+    for (const host of APP_PORT_PROBE_HOSTS) {
+      if (!(await isFreeOn(port, host))) return false;
+    }
+    return true;
   };
 
   // Try random ports first
@@ -1160,6 +1285,7 @@ export function findPidsOnPort(port: number): number[] {
       const output = execSync("netstat -ano -p tcp", {
         encoding: "utf-8",
         timeout: PID_LOOKUP_TIMEOUT_MS,
+        windowsHide: true,
       });
       const pid = parsePidFromNetstat(output, port);
       return pid === null ? [] : [pid];
@@ -1180,30 +1306,79 @@ export function findPidsOnPort(port: number): number[] {
 }
 
 /**
+ * Read a process's start time. Paired with the PID it identifies one process
+ * instance, so a recycled PID does not match. Linux reads the boot-relative
+ * tick count from /proc, which wall-clock adjustments cannot shift; other
+ * platforms use `ps` in a fixed locale and time zone. Returns null on Windows
+ * or when the process does not exist.
+ */
+export function getProcessStartTime(pid: number): string | null {
+  if (isWindows || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    if (process.platform === "linux") {
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf-8");
+      // Fields after the parenthesized command name; starttime is field 22.
+      const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+      return fields[19] || null;
+    }
+    const output = execFileSync("ps", ["-o", "lstart=", "-p", String(pid)], {
+      encoding: "utf-8",
+      env: { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+    });
+    return output.trim().replace(/\s+/g, " ") || null;
+  } catch {
+    return null;
+  }
+}
+
+/** Read the executable name of a process. Returns null on Windows or when it cannot be read. */
+export function getProcessCommand(pid: number): string | null {
+  if (isWindows || !Number.isInteger(pid) || pid <= 0) return null;
+  try {
+    const output = execFileSync("ps", ["-o", "comm=", "-p", String(pid)], {
+      encoding: "utf-8",
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+    });
+    return path.basename(output.trim()) || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Kill a process group left behind by a portless session that died without
+ * cleaning up. The group is only signaled while its leader is alive, still
+ * leads the group, and has the start time recorded at spawn, so a recycled PID
+ * is not targeted. Returns true when the signal was sent.
+ */
+export function killOrphanedProcessGroup(
+  pgid: number,
+  startTime: string | undefined,
+  signal: NodeJS.Signals = "SIGTERM"
+): boolean {
+  if (isWindows || !Number.isInteger(pgid) || pgid <= 1 || !startTime) return false;
+  try {
+    const output = execFileSync("ps", ["-o", "pgid=", "-p", String(pgid)], {
+      encoding: "utf-8",
+      timeout: PID_LOOKUP_TIMEOUT_MS,
+    });
+    if (Number(output.trim()) !== pgid) return false;
+    if (getProcessStartTime(pgid) !== startTime) return false;
+    process.kill(-pgid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Try to find the PID of a process listening on the given TCP port.
  * Uses lsof on macOS/Linux and netstat on Windows.
  * Returns null if the PID cannot be determined.
  */
 export function findPidOnPort(port: number): number | null {
-  try {
-    if (isWindows) {
-      const output = execSync("netstat -ano -p tcp", {
-        encoding: "utf-8",
-        timeout: PID_LOOKUP_TIMEOUT_MS,
-      });
-      return parsePidFromNetstat(output, port);
-    }
-
-    const output = execSync(`lsof -ti tcp:${port} -sTCP:LISTEN`, {
-      encoding: "utf-8",
-      timeout: PID_LOOKUP_TIMEOUT_MS,
-    });
-    // lsof may return multiple PIDs (one per line); take the first
-    const pid = parseInt(output.trim().split("\n")[0], 10);
-    return isNaN(pid) ? null : pid;
-  } catch {
-    return null;
-  }
+  return findPidsOnPort(port)[0] ?? null;
 }
 
 /**
@@ -1251,7 +1426,8 @@ function collectBinPaths(cwd: string): string[] {
 }
 
 /**
- * Build a PATH string with `node_modules/.bin` directories prepended.
+ * Build a PATH string with `node_modules/.bin` directories prepended and the
+ * running node's directory appended as a fallback.
  */
 export function augmentedPath(env: NodeJS.ProcessEnv | undefined, cwd?: string): string {
   const source = env ?? process.env;
@@ -1259,11 +1435,11 @@ export function augmentedPath(env: NodeJS.ProcessEnv | undefined, cwd?: string):
   // process.env but case-sensitive in plain objects created via spread).
   const base = source.PATH ?? source.Path ?? "";
   const bins = collectBinPaths(cwd ?? process.cwd());
-  // Ensure node's own directory is in PATH so .cmd wrappers in node_modules/.bin
-  // can locate the node executable (fixes Windows "node not recognized" errors).
+  // node's own directory goes last, as a fallback for .cmd wrappers in
+  // node_modules/.bin on Windows ("node not recognized"). Ahead of the caller's
+  // PATH it would shadow the node a version manager (asdf, nvm, fnm, mise) chose.
   const nodeBin = path.dirname(process.execPath);
-  const allBins = [...bins, nodeBin];
-  return allBins.join(path.delimiter) + path.delimiter + base;
+  return [...bins, base, nodeBin].filter(Boolean).join(path.delimiter);
 }
 
 /**
@@ -1277,6 +1453,8 @@ export function spawnCommand(
   options?: {
     env?: NodeJS.ProcessEnv;
     onCleanup?: () => void;
+    /** Called with the child's PID, which is also its process group on Unix. */
+    onSpawn?: (pid: number) => void;
   }
 ): void {
   const env: Record<string, string | undefined> = {
@@ -1297,6 +1475,8 @@ export function spawnCommand(
     }
   }
 
+  const spawnedAt = Date.now();
+
   // On Unix, spawn detached so the child gets its own process group. This
   // lets us kill the entire tree (shell + grandchild dev server) with a
   // single process.kill(-pid, signal) instead of only the immediate child.
@@ -1310,6 +1490,9 @@ export function spawnCommand(
         env,
         detached: true,
       });
+
+  guardWindowsOrphans(child, spawnedAt);
+  if (!isWindows && child.pid) options?.onSpawn?.(child.pid);
 
   let exiting = false;
   let shutdownSignal: NodeJS.Signals | undefined;
@@ -1325,6 +1508,7 @@ export function spawnCommand(
     if (shutdownPoll) clearInterval(shutdownPoll);
     process.removeListener("SIGINT", onSigInt);
     process.removeListener("SIGTERM", onSigTerm);
+    process.removeListener("SIGHUP", onSigHup);
     options?.onCleanup?.();
   };
 
@@ -1365,9 +1549,13 @@ export function spawnCommand(
 
   const onSigInt = () => handleSignal("SIGINT");
   const onSigTerm = () => handleSignal("SIGTERM");
+  // The child runs in its own process group, so it never sees the SIGHUP a
+  // closing terminal sends to the foreground group.
+  const onSigHup = () => handleSignal("SIGHUP");
 
   process.on("SIGINT", onSigInt);
   process.on("SIGTERM", onSigTerm);
+  process.on("SIGHUP", onSigHup);
 
   child.on("error", (err) => {
     if (exiting || shutdownSignal) return;
@@ -1487,7 +1675,22 @@ const FRAMEWORKS_NEEDING_PORT: Record<string, FrameworkSpec> = {
       "--root",
     ],
   },
-  astro: { strictPort: false, serverSubcommands: ["dev", "preview"], defaultIsServer: false },
+  astro: {
+    strictPort: false,
+    serverSubcommands: ["dev", "preview"],
+    defaultIsServer: false,
+    valueFlags: [
+      "--base",
+      "--config",
+      "--host",
+      "--mode",
+      "--open",
+      "--outDir",
+      "--port",
+      "--root",
+      "--site",
+    ],
+  },
   ng: { strictPort: false, serverSubcommands: ["serve", "dev", "s"], defaultIsServer: false },
   "react-native": { strictPort: false, serverSubcommands: ["start"], defaultIsServer: false },
   expo: { strictPort: false, serverSubcommands: ["start", "serve"], defaultIsServer: true },

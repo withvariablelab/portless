@@ -1,4 +1,6 @@
-# Configuration
+---
+title: "Configuration"
+---
 
 Bare `portless` works out of the box. It runs the `"dev"` script from `package.json` through the proxy, inferring the app name from the package name, git root, or directory:
 
@@ -144,7 +146,9 @@ For turborepo projects, use `portless` as the `dev` script and the real command 
 }
 ```
 
-`pnpm dev` at the root runs turbo, which runs `portless` in each package. Portless detects the package manager and runs `pnpm run dev:app` through the proxy. No `turbo.json` changes are needed.
+`pnpm dev` at the root runs turbo, which runs `portless` in each package. Portless detects the package manager and runs `pnpm run dev:app` through the proxy. No `turbo.json` or `turbo.jsonc` changes are needed.
+
+When `portless` runs from a workspace root, it uses the existing Turbo integration to preserve task ordering when either `turbo.json` or `turbo.jsonc` is readable. Set `"turbo": false` in the root portless configuration to use direct spawning instead.
 
 People without portless installed can run `pnpm run dev:app` directly.
 
@@ -222,6 +226,11 @@ For `appPort`: CLI `--app-port` flag > `PORTLESS_APP_PORT` env var > `package.js
     <tr>
       <td>`PORTLESS_NGROK`</td>
       <td>Set to `1` to share apps publicly via ngrok</td>
+      <td>off</td>
+    </tr>
+    <tr>
+      <td>`PORTLESS_CLOUDFLARE`</td>
+      <td>Set to `1` to share apps publicly via a Cloudflare quick tunnel</td>
       <td>off</td>
     </tr>
     <tr>
