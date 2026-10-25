@@ -1201,6 +1201,9 @@ function listRoutesJson(dir: string, proxyPort: number, tls: boolean): void {
     url: formatUrl(route.hostname, proxyPort, tls, route.pathPrefix),
     tailscaleUrl: route.tailscaleUrl ? `${route.tailscaleUrl}${route.pathPrefix ?? ""}` : undefined,
     ngrokUrl: route.ngrokUrl ? `${route.ngrokUrl}${route.pathPrefix ?? ""}` : undefined,
+    cloudflareUrl: route.cloudflareUrl
+      ? `${route.cloudflareUrl}${route.pathPrefix ?? ""}`
+      : undefined,
   }));
   if (loadError) {
     console.error(colors.red(`Error: ${loadError}`));

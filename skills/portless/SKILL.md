@@ -367,7 +367,7 @@ The chosen service configuration is written into launchd, systemd, or Task Sched
 
 **JSON output:** `list`, `get`, `doctor`, and `service status` accept `--json`. Other commands reject it. stdout carries only the JSON, without colors. Warnings and errors go to stderr, and a command that fails exits non-zero. Keys are camelCase and optional fields are omitted when unset.
 
-- `portless list --json`: array of the routes the proxy serves (live processes and aliases) with `hostname`, `pathPrefix`, `port`, `pid` (`0` for an alias), `alias`, `url`, and `tailscaleUrl` or `ngrokUrl` when shared. An unreadable or corrupted routes file exits 1 instead of printing `[]`.
+- `portless list --json`: array of the routes the proxy serves (live processes and aliases) with `hostname`, `pathPrefix`, `port`, `pid` (`0` for an alias), `alias`, `url`, and `tailscaleUrl`, `ngrokUrl`, or `cloudflareUrl` when shared. An unreadable or corrupted routes file exits 1 instead of printing `[]`.
 - `portless get <name> --json`: `name`, `hostname`, `pathPrefix`, `url`, `proxyPort`, `tls`. It does not check whether the service is running. Use `list --json` for that.
 - `portless doctor --json`: `version`, `node`, `platform`, `arch`, `stateDir`, `proxyPort`, `tls`, `tlds`, `lanMode`, `findings` (`status`, `message`, `hint`), `failures`, `warnings`. Exits 1 when a check fails.
 - `portless service status --json`: `installed`, `managerState`, `proxyPort`, `proxyRunning`, `tls`, `tlds`, `lanMode`, `lanIp`, `wildcard`, `stateDir`, `serviceEntry`.

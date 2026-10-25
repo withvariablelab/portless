@@ -306,7 +306,7 @@ portless service status --json
 
 These commands print a JSON document for scripts and agents. stdout carries only the JSON, without colors. Warnings and errors go to stderr, and a command that fails exits non-zero. Other commands reject `--json`. Keys are camelCase, like `routes.json` and `portless.json`, and optional fields are omitted when unset.
 
-- `list`: an array of the routes the proxy serves (live processes and aliases) with `hostname`, `pathPrefix`, `port` (the app's port), `pid` (`0` for an alias), `alias`, `url`, and `tailscaleUrl` or `ngrokUrl` when shared. If the routes file cannot be read or parsed, it exits 1 instead of printing `[]`.
+- `list`: an array of the routes the proxy serves (live processes and aliases) with `hostname`, `pathPrefix`, `port` (the app's port), `pid` (`0` for an alias), `alias`, `url`, and `tailscaleUrl`, `ngrokUrl`, or `cloudflareUrl` when shared. If the routes file cannot be read or parsed, it exits 1 instead of printing `[]`.
 - `get`: `name`, `hostname`, `pathPrefix`, `url`, `proxyPort`, `tls`. Like `get`, it builds the URL without checking whether the service is running.
 - `doctor`: `version`, `node`, `platform`, `arch`, `stateDir`, `proxyPort`, `tls`, `tlds`, `lanMode`, `findings` (each with `status`, `message`, `hint`), `failures`, `warnings`. Exits 1 when a check fails, like `doctor`.
 - `service status`: `installed`, `managerState`, `proxyPort`, `proxyRunning`, `tls`, `tlds`, `lanMode`, `lanIp`, `wildcard`, `stateDir`, `serviceEntry`.

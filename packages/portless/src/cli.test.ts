@@ -498,6 +498,7 @@ describe("CLI", () => {
             pathPrefix: "/api",
             tailscaleUrl: "https://devbox.tail1234.ts.net",
             ngrokUrl: "https://myapp.ngrok.app",
+            cloudflareUrl: "https://quick-words.trycloudflare.com",
           },
         ]);
 
@@ -507,6 +508,7 @@ describe("CLI", () => {
         expect(JSON.parse(stdout)[0]).toMatchObject({
           tailscaleUrl: "https://devbox.tail1234.ts.net/api",
           ngrokUrl: "https://myapp.ngrok.app/api",
+          cloudflareUrl: "https://quick-words.trycloudflare.com/api",
         });
       });
 
