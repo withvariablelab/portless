@@ -1192,19 +1192,23 @@ function listRoutesJson(dir: string, proxyPort: number, tls: boolean): void {
       loadError = msg;
     },
   });
-  const routes = store.loadRoutes().map((route) => ({
-    hostname: route.hostname,
-    pathPrefix: route.pathPrefix,
-    port: route.port,
-    pid: route.pid,
-    alias: route.pid === 0,
-    url: formatUrl(route.hostname, proxyPort, tls, route.pathPrefix),
-    tailscaleUrl: route.tailscaleUrl ? `${route.tailscaleUrl}${route.pathPrefix ?? ""}` : undefined,
-    ngrokUrl: route.ngrokUrl ? `${route.ngrokUrl}${route.pathPrefix ?? ""}` : undefined,
-    cloudflareUrl: route.cloudflareUrl
-      ? `${route.cloudflareUrl}${route.pathPrefix ?? ""}`
-      : undefined,
-  }));
+  const routes = store.loadRoutes().map((route) => {
+    // Tunnels dial the app's port directly, so their URLs carry the prefix too.
+    const withPrefix = (url: string | null | undefined) =>
+      url ? `${url}${route.pathPrefix ?? ""}` : undefined;
+    return {
+      hostname: route.hostname,
+      pathPrefix: route.pathPrefix,
+      port: route.port,
+      pid: route.pid,
+      alias: route.pid === 0,
+      url: formatUrl(route.hostname, proxyPort, tls, route.pathPrefix),
+      tailscaleUrl: withPrefix(route.tailscaleUrl),
+      ...Object.fromEntries(
+        PROCESS_TUNNELS.map((t) => [t.urlField, withPrefix(route[t.urlField])])
+      ),
+    };
+  });
   if (loadError) {
     console.error(colors.red(`Error: ${loadError}`));
     process.exitCode = 1;

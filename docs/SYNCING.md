@@ -72,7 +72,7 @@ The fork touches a small set of files, so conflicts cluster there:
 Some breaks are not conflicts, because upstream's new code merges cleanly next to the fork's. After resolving, check:
 
 - every `store.addRoute`, `store.updateRoute`, `store.removeRoute`, and `removeRoutes` call in upstream's new code passes the route's `pathPrefix`. Without it the call misses a `--path` route, or changes the root route of the same hostname, which may belong to another app.
-- a new route field (like `registeredAt`) or a new tunnel (like `--cloudflare`) also reaches the fork's `--json` output, its docs, and the fork tests that compare whole routes.
+- a new route field (like `registeredAt`) reaches the fork tests that compare whole routes, and a new tunnel (like `--cloudflare`) reaches the `--json` docs. `list --json` takes its tunnel URLs from upstream's `PROCESS_TUNNELS` table.
 
 Do not modify `CHANGELOG.md` or `LICENSE`: both stay upstream's. The fork's release notes live in `CHANGELOG.fork.md`.
 
