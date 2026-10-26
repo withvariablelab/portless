@@ -2,17 +2,37 @@
 
 Release notes for `@variablelab/portless`. Upstream's own history is in [CHANGELOG.md](./CHANGELOG.md).
 
-## 0.0.5
+## 0.0.6
 
 <!-- release:start -->
+
+Based on upstream [portless v0.15.11](https://github.com/vercel-labs/portless/releases/tag/v0.15.11), merged in [#10](https://github.com/withvariablelab/portless/pull/10). Releases up to 0.0.5 were based on v0.15.6.
+
+### Changed
+
+- **Upstream v0.15.7 to v0.15.11**: everything in upstream's [changelog](https://github.com/vercel-labs/portless/blob/v0.15.11/CHANGELOG.md) for these versions is in this release. Among others:
+  - Closing the terminal stops the dev server, and `portless run` and `portless prune` stop dev servers left behind by a crashed session.
+  - App ports are only assigned when they are free on every local address.
+  - Child commands use the node a version manager put first on `PATH`.
+  - Certificate fixes: the CA's Basic Constraints, two-label host certificates, clock skew, and certificates only for the configured TLDs.
+  - The proxy stops forwarding client hop-by-hop headers, keeps reading the request body after a backend error, and answers non-browser clients with JSON errors.
+  - `--cloudflare` shares an app through a Cloudflare quick tunnel. `portless list` and the 404 page show each route's uptime, and the 404 page can filter its app list.
+- **Wildcard subdomains**: upstream now routes an unregistered subdomain to the closest registered parent too ([vercel-labs/portless#446](https://github.com/vercel-labs/portless/pull/446)). The fork builds on it and still picks the path prefix among that parent's routes only, so the behavior from 0.0.3 is unchanged.
+- **Crashed-session cleanup with `--path`**: the process group portless records to stop an orphaned dev server is stored on the app's own route, the hostname and path prefix it registered, never on another app's route for the same hostname.
+
+### Added
+
+- `portless list --json` includes `cloudflareUrl`, with the route's path prefix, for apps shared with `--cloudflare`.
+
+<!-- release:end -->
+
+## 0.0.5
 
 Based on upstream [portless v0.15.6](https://github.com/vercel-labs/portless/releases/tag/v0.15.6) (upstream `main` at `1ad573b`), the same base as 0.0.4.
 
 ### Changed
 
 - The repository moved to [withvariablelab/portless](https://github.com/withvariablelab/portless). The package name and the CLI are unchanged.
-
-<!-- release:end -->
 
 ## 0.0.4
 
