@@ -3,8 +3,21 @@ import * as http from "node:http";
 import * as http2 from "node:http2";
 import * as net from "node:net";
 import type { ProxyServerOptions, RouteInfo } from "./types.js";
-import { createLoopbackConnection, escapeHtml, formatUrl } from "./utils.js";
-import { ARROW_SVG, renderPage } from "./pages.js";
+import {
+  createLoopbackConnection,
+  escapeHtml,
+  formatUptime,
+  formatUrl,
+  parsePort,
+} from "./utils.js";
+import {
+  ARROW_SVG,
+  FILTER_CONTROLS,
+  FILTER_NO_MATCH,
+  FILTER_SCRIPT,
+  FILTER_THRESHOLD,
+  renderPage,
+} from "./pages.js";
 import {
   HOSTS_SYNC_AUTH_CHALLENGE_HEADER,
   HOSTS_SYNC_AUTH_HEADER,
@@ -36,6 +49,14 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 /**
+ * Client hop-by-hop headers dropped before forwarding a plain request.
+ * Forwarding `Connection: keep-alive` leaves the backend socket open after
+ * the response with no error listener, so a backend restart crashes the
+ * proxy. `transfer-encoding` stays: it frames the streamed request body.
+ */
+const REQUEST_HOP_BY_HOP_HEADERS = ["connection", "keep-alive", "proxy-connection", "upgrade"];
+
+/**
  * Get the effective host value from a request.
  * HTTP/2 uses the :authority pseudo-header; HTTP/1.1 uses Host.
  */
@@ -65,7 +86,7 @@ function isLoopbackPeer(address: string | undefined): boolean {
 function hasValidPort(authority: string, hostname: string): boolean {
   if (authority === hostname) return true;
   const port = authority.slice(hostname.length + 1);
-  return /^\d+$/.test(port) && Number(port) >= 1 && Number(port) <= 65535;
+  return parsePort(port) !== null;
 }
 
 function isLoopbackAuthority(authority: string): boolean {
@@ -192,16 +213,37 @@ function normalizeAuthority(host: string): string {
   return lower.endsWith(":443") ? lower.slice(0, -":443".length) : lower;
 }
 
+function findMostSpecificParent<T extends { hostname: string }>(
+  routes: T[],
+  hostname: string
+): T | undefined {
+  let best: T | undefined;
+  for (const r of routes) {
+    if (
+      hostname.endsWith("." + r.hostname.toLowerCase()) &&
+      (!best || r.hostname.length > best.hostname.length)
+    ) {
+      best = r;
+    }
+  }
+  return best;
+}
+
 /**
  * Find the route matching a request's host (which may include a port) and URL
  * path. Match order: local hostname, tailscale authority (hostname and port),
- * tailscale hostname ignoring port, then wildcard subdomain, where the closest
- * registered parent hostname wins. `strict` drops the wildcard tier. Within
- * the matched local or parent hostname, several routes may differ only by
- * `pathPrefix`; the longest matching prefix wins and routes without a
+ * tailscale hostname ignoring port, then wildcard subdomain. The authority tier
+ * disambiguates apps sharing a `.ts.net` hostname on different ports; the
+ * hostname tier keeps other-port requests resolving. The wildcard tier picks the
+ * longest registered parent, so nested routes resolve regardless of storage
+ * order. `strict` drops the wildcard.
+ * Within the matched local or parent hostname, several routes may differ only
+ * by `pathPrefix`; the longest matching prefix wins and routes without a
  * `pathPrefix` act as root catch-all. Tailscale tiers skip path selection: a
  * tailscale URL identifies a single route and its requests are not
  * path-prefixed.
+ * All comparisons run against the normalized authority so they are
+ * case-insensitive and treat an explicit `:443` as the default HTTPS port.
  */
 function findRoute(
   routes: RouteInfo[],
@@ -238,13 +280,34 @@ function findRoute(
   if (tsHostnameMatch) return tsHostnameMatch;
 
   if (strict) return undefined;
-  // Every candidate is a dot-bounded suffix of the request hostname, so the
-  // longest one is the closest parent (and equal lengths mean the same host).
-  // It owns the request like an exact match would: path selection never falls
-  // through to a farther parent, so routes.json order cannot mix apps.
-  const parents = routes.filter((r) => hostname.endsWith("." + r.hostname.toLowerCase()));
-  const closest = Math.max(0, ...parents.map((r) => r.hostname.length));
-  return pickByPath(parents.filter((r) => r.hostname.length === closest));
+  // The closest parent owns the request like an exact match would: path
+  // selection never falls through to a farther parent, so routes.json order
+  // cannot mix apps.
+  const parent = findMostSpecificParent(routes, hostname)?.hostname.toLowerCase();
+  return parent ? pickByPath(routes.filter((r) => r.hostname.toLowerCase() === parent)) : undefined;
+}
+
+/**
+ * Send a portless-generated error as the HTML page when the client accepts text/html, otherwise as a small JSON body.
+ * `renderHtml` is only called for HTML clients, so JSON clients never pay for building the page.
+ */
+function sendProxyError(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  status: number,
+  error: string,
+  message: string,
+  host: string,
+  renderHtml: () => string
+): void {
+  res.setHeader("Vary", "Accept");
+  if ((req.headers.accept ?? "").toLowerCase().includes("text/html")) {
+    res.writeHead(status, { "Content-Type": "text/html" });
+    res.end(renderHtml());
+    return;
+  }
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify({ error, upstream: host, message }));
 }
 
 /** Server type returned by createProxyServer (plain HTTP/1.1 or net.Server TLS wrapper). */
@@ -327,18 +390,24 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           `This usually means a backend is proxying back through portless without rewriting ` +
           `the Host header. If you use Vite/webpack proxy, set changeOrigin: true.`
       );
-      res.writeHead(508, { "Content-Type": "text/html" });
-      res.end(
-        renderPage(
-          508,
-          "Loop Detected",
-          `<div class="content"><p class="desc">This request has passed through portless ${hops} times. This usually means a dev server (Vite, webpack, etc.) is proxying requests back through portless without rewriting the Host header.</p><div class="section"><p class="label">Fix: add changeOrigin to your proxy config</p><pre class="terminal">proxy: {
+      sendProxyError(
+        req,
+        res,
+        508,
+        "loop_detected",
+        `Request passed through portless ${hops} times`,
+        host,
+        () =>
+          renderPage(
+            508,
+            "Loop Detected",
+            `<div class="content"><p class="desc">This request has passed through portless ${hops} times. This usually means a dev server (Vite, webpack, etc.) is proxying requests back through portless without rewriting the Host header.</p><div class="section"><p class="label">Fix: add changeOrigin to your proxy config</p><pre class="terminal">proxy: {
   "/api": {
     target: "${reqTls ? "https" : "http"}://&lt;backend&gt;${escapeHtml(primaryTldSuffix)}${reqTls ? "" : ":&lt;port&gt;"}",
     changeOrigin: true,
   },
 }</pre></div></div>`
-        )
+          )
       );
       return;
     }
@@ -355,19 +424,21 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           ? host.slice(0, -matchedSuffix.length)
           : host;
       const safeSuggestion = escapeHtml(strippedHost);
+      const now = Date.now();
+      const filterable = routes.length > FILTER_THRESHOLD;
+      const items = routes
+        .map((r) => {
+          const age = formatUptime(r.registeredAt, now);
+          const label = r.pid === 0 ? "alias" : age && `up ${age}`;
+          const uptimeHtml = label ? `<span class="uptime">${label}</span>` : "";
+          return `<li><a href="${escapeHtml(formatUrl(r.hostname, proxyPort, reqTls, r.pathPrefix))}" class="card-link"><span class="name">${escapeHtml(r.hostname + (r.pathPrefix ?? ""))}</span><span class="meta">${uptimeHtml}<code class="port">127.0.0.1:${escapeHtml(String(r.port))}</code><span class="arrow">${ARROW_SVG}</span></span></a></li>`;
+        })
+        .join("");
       const routesList =
         routes.length > 0
-          ? `<div class="section"><p class="label">Active apps</p><ul class="card">${routes
-              .map((r) => {
-                const displayName = r.pathPrefix
-                  ? `${escapeHtml(r.hostname)}${escapeHtml(r.pathPrefix)}`
-                  : escapeHtml(r.hostname);
-                return `<li><a href="${escapeHtml(formatUrl(r.hostname, proxyPort, reqTls, r.pathPrefix))}" class="card-link"><span class="name">${displayName}</span><span class="meta"><code class="port">127.0.0.1:${escapeHtml(String(r.port))}</code><span class="arrow">${ARROW_SVG}</span></span></a></li>`;
-              })
-              .join("")}</ul></div>`
+          ? `<div class="section"><p class="label">Active apps</p>${filterable ? FILTER_CONTROLS : ""}<ul class="card">${items}</ul>${filterable ? FILTER_NO_MATCH : ""}</div>${filterable ? `<script>${FILTER_SCRIPT}</script>` : ""}`
           : '<p class="empty">No apps running.</p>';
-      res.writeHead(404, { "Content-Type": "text/html" });
-      res.end(
+      sendProxyError(req, res, 404, "not_found", `No app registered for ${host}`, host, () =>
         renderPage(
           404,
           "Not Found",
@@ -388,6 +459,9 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
       if (key.startsWith(":")) {
         delete proxyReqHeaders[key];
       }
+    }
+    for (const h of REQUEST_HOP_BY_HOP_HEADERS) {
+      delete proxyReqHeaders[h];
     }
     // HTTP/2 carries the hostname only in :authority (stripped above); restore
     // it as Host so Host-dependent backends (multi-tenant vhosts, framework
@@ -428,6 +502,8 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
     );
 
     proxyReq.on("error", (err) => {
+      req.unpipe(proxyReq);
+      req.resume();
       onError(`Proxy error for ${getRequestHost(req)}: ${err.message}`);
       if (!res.headersSent) {
         const errWithCode = err as NodeJS.ErrnoException;
@@ -435,8 +511,7 @@ export function createProxyServer(options: ProxyServerOptions): ProxyServer {
           errWithCode.code === "ECONNREFUSED"
             ? "The target app is not responding. It may have crashed."
             : "The target app may not be running.";
-        res.writeHead(502, { "Content-Type": "text/html" });
-        res.end(
+        sendProxyError(req, res, 502, "bad_gateway", detail, getRequestHost(req), () =>
           renderPage(
             502,
             "Bad Gateway",

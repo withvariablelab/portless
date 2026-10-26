@@ -1,6 +1,6 @@
 # portless
 
-> **This is a fork.** `@variablelab/portless` is [vercel-labs/portless](https://github.com/vercel-labs/portless) plus path-based routing: the `--path` flag, `PORTLESS_PATH`, and the `path` config field, so several apps can share one hostname and be dispatched by URL prefix. That feature is proposed upstream in [PR #165](https://github.com/vercel-labs/portless/pull/165) and is pending review; this package exists so it can be used in the meantime. Everything else is upstream portless, created and maintained by Vercel Labs (see [NOTICE](./NOTICE)). The fork tracks upstream `main` (see [docs/SYNCING.md](./docs/SYNCING.md)) and keeps its own [changelog](./CHANGELOG.fork.md).
+> **This is a fork.** `@variablelab/portless` is [vercel-labs/portless](https://github.com/vercel-labs/portless) plus path-based routing: the `--path` flag, `PORTLESS_PATH`, and the `path` config field, so several apps can share one hostname and be dispatched by URL prefix. That feature is proposed upstream in [PR #165](https://github.com/vercel-labs/portless/pull/165) and is pending review; this package exists so it can be used in the meantime. Everything else is upstream portless, created and maintained by Vercel Labs (see [NOTICE](./NOTICE)). The fork tracks upstream releases (see [docs/SYNCING.md](./docs/SYNCING.md)) and keeps its own [changelog](./CHANGELOG.fork.md).
 >
 > ```bash
 > npm install -g @variablelab/portless
@@ -9,6 +9,13 @@
 > The installed command is `portless`, the same as upstream, so run `npm uninstall -g portless` first if you have the upstream package installed globally. Jump to [Path-based routing](#path-based-routing) for the fork-specific docs.
 
 Replace port numbers with stable, named .localhost URLs for local development. For humans and agents.
+
+<p>
+  <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
+  <a href="https://www.npmjs.com/package/portless"><img alt="npm version: portless" src="https://img.shields.io/npm/v/portless.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
+  <a href="https://github.com/vercel-labs/portless/blob/main/LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/github/license/vercel-labs/portless.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>
+  <a href="https://www.npmjs.com/package/portless"><img alt="npm downloads per month: portless" src="https://img.shields.io/npm/dm/portless.svg?style=for-the-badge&amp;labelColor=000000&amp;label=npm%20downloads" height="28"></a>
+</p>
 
 ```diff
 - "dev": "next dev"                  # http://localhost:3000
@@ -158,9 +165,11 @@ To use portless with turborepo, put `portless` as the `dev` script and the real 
 }
 ```
 
-Turbo runs each package's `dev` script, which invokes portless. Portless reads the config, detects the package manager, and runs `pnpm run dev:app` (or yarn/bun/npm) through the proxy. No changes to `turbo.json` are needed.
+Turbo runs each package's `dev` script, which invokes portless. Portless reads the config, detects the package manager, and runs `pnpm run dev:app` (or yarn/bun/npm) through the proxy. No changes to `turbo.json` or `turbo.jsonc` are needed.
 
 `pnpm dev` at the root works through turbo as usual. People without portless can run `pnpm run dev:app` directly.
+
+When `portless` runs from a workspace root, it uses the existing Turbo integration to preserve task ordering when either `turbo.json` or `turbo.jsonc` is readable. Set `"turbo": false` in the root portless configuration to use direct spawning instead.
 
 ## Use in package.json
 
@@ -202,7 +211,7 @@ portless docs.myapp next dev
 # -> https://docs.myapp.localhost
 ```
 
-By default, only explicitly registered subdomains are routed (strict mode). Use `--wildcard` when starting the proxy to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app without extra registration). When several registered routes are parents of the requested subdomain, the closest one wins: with `myapp.localhost` and `fix-ui.myapp.localhost` both running, `tenant1.fix-ui.myapp.localhost` routes to `fix-ui.myapp`, whatever order they were registered in.
+By default, only explicitly registered subdomains are routed (strict mode). Use `--wildcard` when starting the proxy to allow any subdomain of a registered route to fall back to that app (e.g. `tenant1.myapp.localhost` routes to the `myapp` app without extra registration). When several registered routes are parents of the host, the most specific one wins (`admin.api.myapp.localhost` routes to `api.myapp`, not `myapp`).
 
 ## Git Worktrees
 
@@ -376,6 +385,8 @@ flowchart TD
 
 Outside LAN mode, the proxy and its HTTP redirect listener bind only to the IPv4 and IPv6 loopback addresses, `127.0.0.1` and `::1`. They do not accept connections through LAN, VPN, or other network interfaces.
 
+When portless itself returns an error (404 for an unknown host, 502 when the app is unreachable, 508 for a request loop), browsers get a branded HTML page. Any client whose `Accept` header does not include `text/html`, such as curl or `fetch`, gets a small JSON body instead, e.g. `{"error":"bad_gateway","upstream":"myapp.localhost","message":"..."}`. Responses from your own app are forwarded unchanged.
+
 ## HTTP/2 + HTTPS
 
 HTTPS with HTTP/2 is enabled by default. Browsers limit HTTP/1.1 to 6 connections per host, which bottlenecks dev servers that serve many unbundled files (Vite, Nuxt, etc.). HTTP/2 multiplexes all requests over a single connection.
@@ -485,6 +496,17 @@ Set `PORTLESS_NGROK=1` in your shell profile or `.env` to enable ngrok by defaul
 
 Requires the ngrok CLI to be installed and authenticated. If ngrok reports an authentication error, run `ngrok config add-authtoken <token>` and try again.
 
+## Cloudflare sharing
+
+Expose your dev server to the public internet with a Cloudflare quick tunnel. No Cloudflare account is needed:
+
+```bash
+portless myapp --cloudflare next dev
+# -> https://<random>.trycloudflare.com (public)
+```
+
+Set `PORTLESS_CLOUDFLARE=1` to enable it by default. `portless list` shows the Cloudflare URL, and the app gets it as `PORTLESS_CLOUDFLARE_URL`. You can combine it with `--ngrok`, `--tailscale` or `--funnel`. The tunnel stops when the app exits. Quick tunnels do not support Server-Sent Events, allow at most 200 in-flight requests, and get a new URL on every run. Requires the [`cloudflared`](https://developers.cloudflare.com/tunnel/downloads/) CLI on your PATH.
+
 ## Commands
 
 ```bash
@@ -495,13 +517,13 @@ portless <name> [--path <prefix>] <cmd> [args...]  # Run app at https://<name>.l
 portless alias <name> <port>     # Register a static route (e.g. for Docker)
 portless alias <name> <port> --force  # Overwrite an existing route
 portless alias --remove <name>   # Remove a static route
-portless list                    # Show active routes
+portless list                    # Show active routes and uptime
 portless list --json             # Print active routes as JSON (for scripts)
 portless doctor                  # Check proxy, routes, DNS, and CA trust
 portless trust                   # Add local CA to system trust store
 portless clean                   # Remove state, CA trust entry, and hosts block
-portless prune                   # Kill orphaned dev servers from crashed sessions
-portless hosts sync              # Add routes to /etc/hosts (fixes Safari)
+portless prune                   # Kill orphaned dev servers from crashed sessions (run also does this on start)
+portless hosts sync              # Reconcile routes with /etc/hosts (fixes Safari)
 portless hosts clean             # Remove portless entries from /etc/hosts
 
 # Disable portless (run command directly)
@@ -546,12 +568,12 @@ portless list --json
 # ]
 ```
 
-| Command                          | Output                                                                                                                                                                                                                                                                                      |
-| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `portless list --json`           | Array of the routes the proxy serves (live processes and aliases): `hostname`, `pathPrefix`, `port` (the app's port), `pid` (`0` for an alias), `alias`, `url`, and `tailscaleUrl` or `ngrokUrl` when shared. A routes file that cannot be read or parsed exits 1 instead of printing `[]`. |
-| `portless get <name> --json`     | `name`, `hostname`, `pathPrefix`, `url`, `proxyPort`, `tls`. Like `get`, it builds the URL without checking whether the service is running.                                                                                                                                                 |
-| `portless doctor --json`         | `version`, `node`, `platform`, `arch`, `stateDir`, `proxyPort`, `tls`, `tlds`, `lanMode`, `findings` (each with `status`, `message`, `hint`), `failures`, `warnings`. Exits 1 when a check fails, like `doctor`.                                                                            |
-| `portless service status --json` | `installed`, `managerState`, `proxyPort`, `proxyRunning`, `tls`, `tlds`, `lanMode`, `lanIp`, `wildcard`, `stateDir`, `serviceEntry`.                                                                                                                                                        |
+| Command                          | Output                                                                                                                                                                                                                                                                                                        |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `portless list --json`           | Array of the routes the proxy serves (live processes and aliases): `hostname`, `pathPrefix`, `port` (the app's port), `pid` (`0` for an alias), `alias`, `url`, and `tailscaleUrl`, `ngrokUrl`, or `cloudflareUrl` when shared. A routes file that cannot be read or parsed exits 1 instead of printing `[]`. |
+| `portless get <name> --json`     | `name`, `hostname`, `pathPrefix`, `url`, `proxyPort`, `tls`. Like `get`, it builds the URL without checking whether the service is running.                                                                                                                                                                   |
+| `portless doctor --json`         | `version`, `node`, `platform`, `arch`, `stateDir`, `proxyPort`, `tls`, `tlds`, `lanMode`, `findings` (each with `status`, `message`, `hint`), `failures`, `warnings`. Exits 1 when a check fails, like `doctor`.                                                                                              |
+| `portless service status --json` | `installed`, `managerState`, `proxyPort`, `proxyRunning`, `tls`, `tlds`, `lanMode`, `lanIp`, `wildcard`, `stateDir`, `serviceEntry`.                                                                                                                                                                          |
 
 ### Options
 
@@ -573,6 +595,7 @@ portless list --json
 --tailscale                      Share the app on your Tailscale network (tailnet)
 --funnel                         Share the app publicly via Tailscale Funnel
 --ngrok                          Share the app publicly via ngrok
+--cloudflare                     Share the app publicly via a Cloudflare quick tunnel
 --force                          Kill the existing process and take over its route
 --name <name>                    Use <name> as the app name
 ```
@@ -593,6 +616,7 @@ PORTLESS_PATH=<path>             Path prefix for path-based routing (e.g. /api)
 PORTLESS_TAILSCALE=1             Share apps on your Tailscale network (same as --tailscale)
 PORTLESS_FUNNEL=1                Share apps publicly via Tailscale Funnel (same as --funnel)
 PORTLESS_NGROK=1                 Share apps publicly via ngrok (same as --ngrok)
+PORTLESS_CLOUDFLARE=1            Share apps publicly via Cloudflare (same as --cloudflare)
 PORTLESS_STATE_DIR=<path>        Override the state directory
 
 # Injected into child processes
@@ -601,6 +625,7 @@ HOST                             Usually 127.0.0.1 (omitted for Expo in LAN mode
 PORTLESS_URL                     Primary public URL (e.g. https://myapp.localhost)
 PORTLESS_TAILSCALE_URL           Tailscale URL of the app (when --tailscale is active)
 PORTLESS_NGROK_URL               ngrok URL of the app (when --ngrok is active)
+PORTLESS_CLOUDFLARE_URL          Cloudflare URL of the app (when --cloudflare is active)
 NODE_EXTRA_CA_CERTS              Path to the portless CA (when HTTPS is active)
 ```
 
@@ -623,11 +648,13 @@ macOS/Linux may prompt for `sudo`. Custom certificate paths passed with `--cert`
 If Safari can't find your `.localhost` URL:
 
 ```bash
-portless hosts sync    # Add current routes to /etc/hosts
+portless hosts sync    # Reconcile current routes with /etc/hosts
 portless hosts clean   # Clean up later
 ```
 
 Auto-syncs `/etc/hosts` for route hostnames by default (`.localhost`, custom TLDs, LAN `.local`). Set `PORTLESS_SYNC_HOSTS=0` to disable. If a route hostname will not resolve, the command that registered it warns and points you to `portless hosts sync`.
+
+Manual sync reconciles portless-managed entries with current routes and removes stale entries when there are no routes. It requires a successful initial hosts-file read before writing and verifies each write. A read or verification failure follows the normal sync error path.
 
 ## Troubleshooting
 
@@ -689,3 +716,4 @@ pnpm format           # Format all files with Prettier
 - macOS, Linux, or Windows
 - Tailscale CLI (optional, for `--tailscale` and `--funnel`)
 - ngrok CLI (optional, for `--ngrok`)
+- cloudflared CLI (optional, for `--cloudflare`)

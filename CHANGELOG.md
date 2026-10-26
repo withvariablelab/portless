@@ -1,8 +1,107 @@
 # Changelog
 
-## 0.15.6
+## 0.15.11
 
 <!-- release:start -->
+
+### Bug Fixes
+
+- **Static aliases**: Allow `--force` to replace a static alias without treating it as a running process, and explain when the alias must be re-added. (#476)
+- **Configuration source**: Report whether the configured app name came from `package.json` or `portless.json`. (#490)
+- **Route liveness**: Keep live routes when the current user lacks permission to signal their processes. (#498)
+- **Tailscale ports**: Account for ports held by foreground serve and funnel sessions when assigning HTTPS ports. (#499)
+- **Astro global options**: Inject the assigned port and host when global options appear before the Astro subcommand. (#500)
+- **Certificate scope**: Reject TLS server names outside the configured TLDs or with invalid hostname characters, and limit new macOS CA trust to SSL. (#497)
+- **Certificate clock skew**: Backdate CA, server, and host certificates by five minutes on OpenSSL 3.4 or newer so clients with slightly slower clocks can connect. (#501)
+- **Windows helper processes**: Hide console windows for OpenSSL and other helper commands when running without a terminal. (#502)
+- **Backend failures**: Drain the remaining request body after a backend error so client connections do not stall. (#489)
+
+### Contributors
+
+- @lahfir
+- @tlq5l
+- @bercedev
+- @sensei-woo
+- @gyanu2507
+- @snomiao
+- @arturo-tikamaru
+
+<!-- release:end -->
+
+## 0.15.10
+
+### Bug Fixes
+
+- **Host certificates**: Omit invalid sibling wildcard names from two-label host certificates and regenerate cached certificates that contain them, fixing TLS rejection on Apple platforms. (#491)
+- **Proxy error responses**: Return JSON for portless-generated 404, 502, and 508 errors when the client does not accept HTML. (#485)
+- **Port validation**: Reject malformed port values instead of accepting leading digits across CLI flags, environment variables, aliases, and service configuration. (#493)
+
+### Contributors
+
+- @lahfir
+- @BlvckParrot
+- @BetterAndBetterII
+
+## 0.15.9
+
+### New Features
+
+- Added **Cloudflare quick tunnels** with `--cloudflare` to share apps through a public URL (#480)
+- Added **route uptime** to the proxy app list and `portless list` (#472)
+- Added **hostname filtering** and a **newest-first toggle** to the proxy's 404-page app list (#473, #474)
+
+### Bug Fixes
+
+- Fixed **uppercase URL schemes** so HTTP and HTTPS prefixes are removed correctly from hostnames (#484)
+
+### Contributors
+
+- @lahfir
+- @kumburovicbranko682-boop
+
+## 0.15.8
+
+### Bug Fixes
+
+- **Terminal close cleanup**: Closing the terminal now stops dev servers launched directly, through Turbo, or in multi-app mode instead of leaving them running on their ports. (#450)
+- **Crashed session cleanup**: `portless run` and `portless prune` now stop orphaned command process groups from crashed sessions, including descendants outside the route port, while checking process identity before signaling. (#451)
+- **Windows command cleanup**: Normal exits and force-kills now terminate the command tree, including Turbo and its dev servers, so orphaned processes no longer keep consuming shell input. (#438)
+
+### Contributors
+
+- @Railly
+
+## 0.15.7
+
+### New Features
+
+- **Turbo JSONC workspaces**: Workspaces that only have `turbo.jsonc` now use Turbo orchestration, the same as `turbo.json`. (#422)
+- **Unresolved hostname warning**: After registering a route, portless asks the proxy to sync the hosts file and warns when the hostname still does not resolve. (#374)
+- **WebMCP documentation site**: The docs moved to Geistdocs and expose their pages to agents through WebMCP. (#427)
+
+### Bug Fixes
+
+- **Hosts sync data loss**: Manual hosts sync refuses to write when the hosts file cannot be read, verifies what it wrote, and removes stale managed entries when no routes remain. (#424)
+- **Local CA certificate**: The generated CA no longer carries a duplicate Basic Constraints extension on OpenSSL 1.1.1 and LibreSSL, which macOS and OpenSSL 3 rejected and left `*.localhost` untrusted. (#443)
+- **Proxy crash on backend restart**: The proxy no longer forwards client hop-by-hop headers, which left backend sockets open and crashed the proxy with `ECONNRESET` when a backend restarted. (#445)
+- **Wildcard fallback order**: With `--wildcard`, an unregistered subdomain now routes to the most specific registered parent instead of the first one stored. (#446)
+- **Occupied app ports**: Free app ports are checked on `127.0.0.1`, `::1`, `0.0.0.0` and `::`, so portless no longer assigns a port another server already holds. (#447)
+- **Version manager node**: Child commands now use the node a version manager put first on `PATH`; portless's own node directory is only a fallback. (#448)
+
+### Contributors
+
+- @Railly
+- @ctate
+- @Knat-Dev
+- @EfeDurmaz16
+- @octo-patch
+- @bilinkis
+- @luizfm
+- @Geektrovert
+- @thazhemadam
+- @begininvoke
+
+## 0.15.6
 
 ### New Features
 
@@ -19,7 +118,6 @@
 - @Railly
 - @EfeDurmaz16
 - @JohnPhamous
-<!-- release:end -->
 
 ## 0.15.5
 
